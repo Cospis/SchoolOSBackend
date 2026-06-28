@@ -8,6 +8,72 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'schoolos_secret_key_123';
 
+// Database Migration for 'active' column and teacher profiles
+(async () => {
+  try {
+    const columns = await query.all("PRAGMA table_info(users)");
+    const hasActive = columns.some(c => c.name === 'active');
+    if (!hasActive) {
+      await query.run("ALTER TABLE users ADD COLUMN active INTEGER DEFAULT 1");
+      console.log("Migration: Added 'active' column to 'users' table.");
+    }
+
+    const hasInvitationStatus = columns.some(c => c.name === 'invitation_status');
+    if (!hasInvitationStatus) {
+      await query.run("ALTER TABLE users ADD COLUMN invitation_status TEXT DEFAULT 'active'");
+      console.log("Migration: Added 'invitation_status' column to 'users' table.");
+    }
+
+    const columnsTeachers = await query.all("PRAGMA table_info(teachers)");
+    const hasClassId = columnsTeachers.some(c => c.name === 'class_id');
+    if (!hasClassId) {
+      await query.run("ALTER TABLE teachers ADD COLUMN class_id INTEGER");
+      console.log("Migration: Added 'class_id' column to 'teachers' table.");
+    }
+
+    // Check for any principal or bursar who doesn't have a teacher profile
+    const staffWithoutProfile = await query.all(`
+      SELECT id, role, name FROM users 
+      WHERE role IN ('principal', 'bursar') 
+        AND id NOT IN (SELECT user_id FROM teachers)
+    `);
+    for (const u of staffWithoutProfile) {
+      const empNo = 'EMP' + u.role.toUpperCase().substring(0, 3) + u.id;
+      const dept = u.role === 'principal' ? 'Administration' : 'Finance';
+      await query.run(`
+        INSERT INTO teachers (user_id, employee_no, department)
+        VALUES (?, ?, ?)
+      `, [u.id, empNo, dept]);
+      console.log(`Migration: Created teacher profile for ${u.role} (${u.name})`);
+    }
+
+    // Create staff_subjects table
+    await query.exec(`
+      CREATE TABLE IF NOT EXISTS staff_subjects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        teacher_id INTEGER,
+        subject_id INTEGER,
+        FOREIGN KEY (teacher_id) REFERENCES users(id),
+        FOREIGN KEY (subject_id) REFERENCES subjects(id),
+        UNIQUE(teacher_id, subject_id)
+      );
+    `);
+
+    // Seed staff_subjects from existing class_subjects
+    const existingStaffSubjectsCount = await query.get('SELECT COUNT(*) as count FROM staff_subjects');
+    if (existingStaffSubjectsCount.count === 0) {
+      console.log("Migration: Seeding staff_subjects table from class_subjects...");
+      await query.exec(`
+        INSERT OR IGNORE INTO staff_subjects (teacher_id, subject_id)
+        SELECT DISTINCT teacher_id, subject_id FROM class_subjects
+        WHERE teacher_id IS NOT NULL AND subject_id IS NOT NULL
+      `);
+    }
+  } catch (err) {
+    console.error("Migration error:", err);
+  }
+})();
+
 app.use(cors());
 app.use(express.json());
 
@@ -34,9 +100,18 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
 
+    if (user.active === 0) {
+      return res.status(403).json({ message: 'Your account has been deactivated. Please contact the administrator.' });
+    }
+
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return res.status(401).json({ message: 'Invalid email or password' });
+    }
+
+    if (user.invitation_status === 'pending') {
+      await query.run("UPDATE users SET invitation_status = 'active' WHERE id = ?", [user.id]);
+      user.invitation_status = 'active';
     }
 
     const token = jwt.sign(
@@ -48,11 +123,88 @@ app.post('/api/auth/login', async (req, res) => {
     // Get secondary details if student or teacher
     let profileDetails = {};
     if (user.role === 'student') {
-      const student = await query.get('SELECT * FROM students WHERE user_id = ?', [user.id]);
+      const student = await query.get('SELECT id as student_id, class_id, parent_id, admission_no, guardian_name, guardian_phone FROM students WHERE user_id = ?', [user.id]);
       profileDetails = student || {};
     } else if (user.role === 'teacher') {
-      const teacher = await query.get('SELECT * FROM teachers WHERE user_id = ?', [user.id]);
-      profileDetails = teacher || {};
+      const teacher = await query.get('SELECT id as teacher_id, employee_no, department, class_id FROM teachers WHERE user_id = ?', [user.id]);
+      let classTeacherClass = null;
+      if (teacher && teacher.class_id) {
+        classTeacherClass = await query.get('SELECT id as class_id, name as class_name, level FROM classes WHERE id = ?', [teacher.class_id]);
+      }
+      profileDetails = {
+        ...(teacher || {}),
+        class_teacher_class: classTeacherClass || null
+      };
+    }
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        phone: user.phone,
+        address: user.address,
+        ...profileDetails
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.post('/api/auth/accept-invitation', async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ message: 'Email and password are required' });
+  }
+
+  try {
+    const user = await query.get('SELECT * FROM users WHERE email = ?', [email]);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    if (user.active === 0) {
+      return res.status(403).json({ message: 'Your account has been deactivated.' });
+    }
+
+    if (user.invitation_status !== 'pending') {
+      return res.status(400).json({ message: 'This invitation has already been accepted.' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    await query.run(
+      "UPDATE users SET password = ?, invitation_status = 'active' WHERE id = ?",
+      [hashedPassword, user.id]
+    );
+
+    const token = jwt.sign(
+      { id: user.id, role: user.role, schoolId: user.school_id },
+      JWT_SECRET,
+      { expiresIn: '1d' }
+    );
+
+    // Get secondary details if student or teacher
+    let profileDetails = {};
+    if (user.role === 'student') {
+      const student = await query.get('SELECT id as student_id, class_id, parent_id, admission_no, guardian_name, guardian_phone FROM students WHERE user_id = ?', [user.id]);
+      profileDetails = student || {};
+    } else if (user.role === 'teacher') {
+      const teacher = await query.get('SELECT id as teacher_id, employee_no, department, class_id FROM teachers WHERE user_id = ?', [user.id]);
+      let classTeacherClass = null;
+      if (teacher && teacher.class_id) {
+        classTeacherClass = await query.get('SELECT id as class_id, name as class_name, level FROM classes WHERE id = ?', [teacher.class_id]);
+      }
+      profileDetails = {
+        ...(teacher || {}),
+        class_teacher_class: classTeacherClass || null
+      };
     }
 
     res.json({
@@ -128,7 +280,7 @@ app.get('/api/students', async (req, res) => {
   try {
     const students = await query.all(`
       SELECT s.id as student_id, u.id as user_id, u.name, u.email, u.phone, 
-             c.name as class_name, c.id as class_id, s.admission_no, s.guardian_name, s.guardian_phone
+             c.name as class_name, c.id as class_id, s.admission_no, s.guardian_name, s.guardian_phone, u.active
       FROM students s
       JOIN users u ON s.user_id = u.id
       LEFT JOIN classes c ON s.class_id = c.id
@@ -184,17 +336,218 @@ app.post('/api/students', async (req, res) => {
   }
 });
 
+app.put('/api/students/:studentId', async (req, res) => {
+  const { studentId } = req.params;
+  const { name, email, phone, class_id, guardian_name, guardian_phone, active } = req.body;
+
+  try {
+    const student = await query.get('SELECT user_id FROM students WHERE id = ?', [studentId]);
+    if (!student) {
+      return res.status(404).json({ message: 'Student not found' });
+    }
+
+    const { user_id } = student;
+
+    if (email) {
+      const existingUser = await query.get('SELECT id FROM users WHERE email = ? AND id != ?', [email, user_id]);
+      if (existingUser) {
+        return res.status(400).json({ message: 'Email already in use by another user' });
+      }
+    }
+
+    await query.run(`
+      UPDATE users 
+      SET name = COALESCE(?, name),
+          email = COALESCE(?, email),
+          phone = COALESCE(?, phone),
+          active = COALESCE(?, active)
+      WHERE id = ?
+    `, [name, email, phone, active !== undefined ? active : null, user_id]);
+
+    await query.run(`
+      UPDATE students
+      SET class_id = COALESCE(?, class_id),
+          guardian_name = COALESCE(?, guardian_name),
+          guardian_phone = COALESCE(?, guardian_phone)
+      WHERE id = ?
+    `, [class_id, guardian_name, guardian_phone, studentId]);
+
+    res.json({ message: 'Student updated successfully' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // ----------------------------------------------------
 // 5. Staff Management
 // ----------------------------------------------------
 app.get('/api/teachers', async (req, res) => {
   try {
     const teachers = await query.all(`
-      SELECT t.id as teacher_id, u.id as user_id, u.name, u.email, u.phone, t.employee_no, t.department
+      SELECT t.id as teacher_id, u.id as user_id, u.name, u.email, u.phone, u.role, u.active, u.invitation_status, t.employee_no, t.department, t.class_id, c.name as class_name
       FROM teachers t
       JOIN users u ON t.user_id = u.id
+      LEFT JOIN classes c ON t.class_id = c.id
     `);
+
+    for (let t of teachers) {
+      const subjects = await query.all(`
+        SELECT s.id, s.name, s.code
+        FROM subjects s
+        JOIN staff_subjects ss ON s.id = ss.subject_id
+        WHERE ss.teacher_id = ?
+      `, [t.user_id]);
+      t.subjects = subjects || [];
+
+      const classSubjects = await query.all(`
+        SELECT cs.class_id, cs.subject_id, c.name as class_name, s.name as subject_name, s.code as subject_code
+        FROM class_subjects cs
+        JOIN classes c ON cs.class_id = c.id
+        JOIN subjects s ON cs.subject_id = s.id
+        WHERE cs.teacher_id = ?
+      `, [t.user_id]);
+      t.class_subjects = classSubjects || [];
+    }
+
     res.json(teachers);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.post('/api/teachers', async (req, res) => {
+  const { name, email, phone, role, employee_no, department, class_id, class_subjects } = req.body;
+
+  if (!name || !email || !role || !employee_no) {
+    return res.status(400).json({ message: 'Name, email, role, and employee number are required' });
+  }
+
+  if (!['teacher', 'principal', 'bursar'].includes(role)) {
+    return res.status(400).json({ message: 'Invalid staff role' });
+  }
+
+  try {
+    // Check if email already in use
+    const existingUser = await query.get('SELECT id FROM users WHERE email = ?', [email]);
+    if (existingUser) {
+      return res.status(400).json({ message: 'Email is already registered' });
+    }
+
+    // Check if employee_no already in use
+    const existingEmp = await query.get('SELECT id FROM teachers WHERE employee_no = ?', [employee_no]);
+    if (existingEmp) {
+      return res.status(400).json({ message: 'Employee number is already in use' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const password = await bcrypt.hash('password123', salt); // default password
+    const school = await query.get('SELECT id FROM schools LIMIT 1');
+
+    // Create user
+    const userResult = await query.run(`
+      INSERT INTO users (school_id, name, email, password, role, phone, invitation_status)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending')
+    `, [school.id, name, email, password, role, phone]);
+
+    const user_id = userResult.id;
+
+    // Create teacher/staff profile
+    const teacherResult = await query.run(`
+      INSERT INTO teachers (user_id, employee_no, department, class_id)
+      VALUES (?, ?, ?, ?)
+    `, [user_id, employee_no, department, class_id || null]);
+
+    // Save subject assignments
+    if (class_subjects && Array.isArray(class_subjects)) {
+      for (const assignment of class_subjects) {
+        await query.run(`
+          INSERT INTO class_subjects (class_id, subject_id, teacher_id)
+          VALUES (?, ?, ?)
+        `, [assignment.class_id, assignment.subject_id, user_id]);
+
+        await query.run(`
+          INSERT OR IGNORE INTO staff_subjects (teacher_id, subject_id)
+          VALUES (?, ?)
+        `, [user_id, assignment.subject_id]);
+      }
+    }
+
+    res.status(201).json({ message: 'Staff member registered successfully', teacherId: teacherResult.id });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error or email already exists' });
+  }
+});
+
+app.put('/api/teachers/:teacherId', async (req, res) => {
+  const { teacherId } = req.params;
+  const { name, email, phone, role, employee_no, department, active, invitation_status, class_id, class_subjects } = req.body;
+
+  try {
+    const teacher = await query.get('SELECT user_id FROM teachers WHERE id = ?', [teacherId]);
+    if (!teacher) {
+      return res.status(404).json({ message: 'Staff member not found' });
+    }
+
+    const { user_id } = teacher;
+
+    if (email) {
+      const existingUser = await query.get('SELECT id FROM users WHERE email = ? AND id != ?', [email, user_id]);
+      if (existingUser) {
+        return res.status(400).json({ message: 'Email already in use by another user' });
+      }
+    }
+
+    if (employee_no) {
+      const existingEmp = await query.get('SELECT id FROM teachers WHERE employee_no = ? AND id != ?', [employee_no, teacherId]);
+      if (existingEmp) {
+        return res.status(400).json({ message: 'Employee number already in use by another staff member' });
+      }
+    }
+
+    if (role && !['teacher', 'principal', 'bursar'].includes(role)) {
+      return res.status(400).json({ message: 'Invalid staff role' });
+    }
+
+    await query.run(`
+      UPDATE users 
+      SET name = COALESCE(?, name),
+          email = COALESCE(?, email),
+          phone = COALESCE(?, phone),
+          role = COALESCE(?, role),
+          active = COALESCE(?, active),
+          invitation_status = COALESCE(?, invitation_status)
+      WHERE id = ?
+    `, [name, email, phone, role, active !== undefined ? active : null, invitation_status || null, user_id]);
+
+    await query.run(`
+      UPDATE teachers
+      SET employee_no = COALESCE(?, employee_no),
+          department = COALESCE(?, department),
+          class_id = CASE WHEN ? = 1 THEN ? ELSE class_id END
+      WHERE id = ?
+    `, [employee_no, department, class_id !== undefined ? 1 : 0, class_id || null, teacherId]);
+
+    // Update subject assignments if provided
+    if (class_subjects && Array.isArray(class_subjects)) {
+      await query.run('DELETE FROM class_subjects WHERE teacher_id = ?', [user_id]);
+      await query.run('DELETE FROM staff_subjects WHERE teacher_id = ?', [user_id]);
+      for (const assignment of class_subjects) {
+        await query.run(`
+          INSERT INTO class_subjects (class_id, subject_id, teacher_id)
+          VALUES (?, ?, ?)
+        `, [assignment.class_id, assignment.subject_id, user_id]);
+
+        await query.run(`
+          INSERT OR IGNORE INTO staff_subjects (teacher_id, subject_id)
+          VALUES (?, ?)
+        `, [user_id, assignment.subject_id]);
+      }
+    }
+
+    res.json({ message: 'Staff member updated successfully' });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Server error' });
@@ -206,7 +559,12 @@ app.get('/api/teachers', async (req, res) => {
 // ----------------------------------------------------
 app.get('/api/classes', async (req, res) => {
   try {
-    const classes = await query.all('SELECT * FROM classes');
+    const classes = await query.all(`
+      SELECT c.*, u.name as class_teacher_name 
+      FROM classes c 
+      LEFT JOIN teachers t ON c.id = t.class_id
+      LEFT JOIN users u ON t.user_id = u.id
+    `);
     res.json(classes);
   } catch (error) {
     console.error(error);
@@ -222,6 +580,37 @@ app.post('/api/classes', async (req, res) => {
       INSERT INTO classes (school_id, name, level) VALUES (?, ?, ?)
     `, [school.id, name, level]);
     res.status(201).json({ id: result.id, name, level });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.put('/api/classes/:id', async (req, res) => {
+  const { id } = req.params;
+  const { name, level } = req.body;
+  try {
+    await query.run(`
+      UPDATE classes
+      SET name = COALESCE(?, name),
+          level = COALESCE(?, level)
+      WHERE id = ?
+    `, [name, level, id]);
+    res.json({ message: 'Class updated successfully' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.delete('/api/classes/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await query.run('UPDATE students SET class_id = NULL WHERE class_id = ?', [id]);
+    await query.run('DELETE FROM fee_structures WHERE class_id = ?', [id]);
+    await query.run('DELETE FROM class_subjects WHERE class_id = ?', [id]);
+    await query.run('DELETE FROM classes WHERE id = ?', [id]);
+    res.json({ message: 'Class deleted successfully' });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Server error' });
@@ -246,6 +635,37 @@ app.post('/api/subjects', async (req, res) => {
       INSERT INTO subjects (school_id, name, code) VALUES (?, ?, ?)
     `, [school.id, name, code]);
     res.status(201).json({ id: result.id, name, code });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.put('/api/subjects/:id', async (req, res) => {
+  const { id } = req.params;
+  const { name, code } = req.body;
+  try {
+    await query.run(`
+      UPDATE subjects
+      SET name = COALESCE(?, name),
+          code = COALESCE(?, code)
+      WHERE id = ?
+    `, [name, code, id]);
+    res.json({ message: 'Subject updated successfully' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.delete('/api/subjects/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await query.run('DELETE FROM class_subjects WHERE subject_id = ?', [id]);
+    await query.run('DELETE FROM staff_subjects WHERE subject_id = ?', [id]);
+    await query.run('DELETE FROM results WHERE subject_id = ?', [id]);
+    await query.run('DELETE FROM subjects WHERE id = ?', [id]);
+    res.json({ message: 'Subject deleted successfully' });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Server error' });
@@ -344,6 +764,95 @@ app.post('/api/results/record', async (req, res) => {
     `, [student_id, activeTerm.id, subject_id, ca, exam, total, grade, comment]);
 
     res.json({ message: 'Result saved successfully', total, grade });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get class broadsheet
+app.get('/api/results/broadsheet/class/:classId', async (req, res) => {
+  const { classId } = req.params;
+  try {
+    const activeTerm = await query.get('SELECT t.id FROM terms t JOIN sessions s ON t.session_id = s.id WHERE t.active = 1 LIMIT 1');
+    if (!activeTerm) return res.status(404).json({ message: 'No active term found' });
+
+    // Fetch all subjects associated with this class
+    const subjects = await query.all(`
+      SELECT DISTINCT s.id as subject_id, s.name as subject_name, s.code as subject_code
+      FROM class_subjects cs
+      JOIN subjects s ON cs.subject_id = s.id
+      WHERE cs.class_id = ?
+    `, [classId]);
+
+    // Fetch all students in this class
+    const students = await query.all(`
+      SELECT s.id as student_id, u.name as student_name, s.admission_no
+      FROM students s
+      JOIN users u ON s.user_id = u.id
+      WHERE s.class_id = ?
+    `, [classId]);
+
+    // Fetch all results for these students in this term
+    const results = await query.all(`
+      SELECT r.student_id, r.subject_id, r.ca_score, r.exam_score, r.total_score, r.grade
+      FROM results r
+      WHERE r.term_id = ? AND r.student_id IN (
+        SELECT id FROM students WHERE class_id = ?
+      )
+    `, [activeTerm.id, classId]);
+
+    // Map student results
+    const resultsMap = {};
+    results.forEach(r => {
+      if (!resultsMap[r.student_id]) {
+        resultsMap[r.student_id] = {};
+      }
+      resultsMap[r.student_id][r.subject_id] = {
+        ca_score: r.ca_score,
+        exam_score: r.exam_score,
+        total_score: r.total_score,
+        grade: r.grade
+      };
+    });
+
+    const studentRows = students.map(st => {
+      const studentScores = resultsMap[st.student_id] || {};
+      let totalSum = 0;
+
+      const subjectGrades = {};
+      subjects.forEach(sub => {
+        const scoreObj = studentScores[sub.subject_id];
+        if (scoreObj) {
+          subjectGrades[sub.subject_id] = scoreObj;
+          totalSum += scoreObj.total_score || 0;
+        } else {
+          subjectGrades[sub.subject_id] = { ca_score: null, exam_score: null, total_score: null, grade: null };
+        }
+      });
+
+      const average = subjects.length > 0 ? (totalSum / subjects.length) : 0;
+
+      return {
+        student_id: st.student_id,
+        student_name: st.student_name,
+        admission_no: st.admission_no,
+        subject_scores: subjectGrades,
+        total_sum: totalSum,
+        average: parseFloat(average.toFixed(2))
+      };
+    });
+
+    // Rank students
+    studentRows.sort((a, b) => b.total_sum - a.total_sum);
+    studentRows.forEach((row, index) => {
+      row.rank = index + 1;
+    });
+
+    res.json({
+      subjects,
+      students: studentRows
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Server error' });

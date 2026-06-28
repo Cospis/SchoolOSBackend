@@ -29,6 +29,8 @@ async function seed() {
         role TEXT CHECK(role IN ('admin', 'principal', 'bursar', 'teacher', 'parent', 'student')),
         phone TEXT,
         address TEXT,
+        active INTEGER DEFAULT 1,
+        invitation_status TEXT DEFAULT 'active',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (school_id) REFERENCES schools(id)
       );
@@ -107,7 +109,9 @@ async function seed() {
         user_id INTEGER UNIQUE,
         employee_no TEXT UNIQUE NOT NULL,
         department TEXT,
-        FOREIGN KEY (user_id) REFERENCES users(id)
+        class_id INTEGER,
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (class_id) REFERENCES classes(id)
       );
     `);
 
@@ -308,13 +312,13 @@ async function seed() {
 
     // 8. Map Staff details
     await query.run(`
-      INSERT INTO teachers (user_id, employee_no, department)
-      VALUES (?, 'EMP001', 'Science & Mathematics')
-    `, [teacherUser1.id]);
+      INSERT INTO teachers (user_id, employee_no, department, class_id)
+      VALUES (?, 'EMP001', 'Science & Mathematics', ?)
+    `, [teacherUser1.id, classJss1.id]);
 
     await query.run(`
-      INSERT INTO teachers (user_id, employee_no, department)
-      VALUES (?, 'EMP002', 'Humanities')
+      INSERT INTO teachers (user_id, employee_no, department, class_id)
+      VALUES (?, 'EMP002', 'Humanities', NULL)
     `, [teacherUser2.id]);
 
     // 9. Map Student details
