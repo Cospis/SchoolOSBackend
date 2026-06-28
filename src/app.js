@@ -69,6 +69,28 @@ const JWT_SECRET = process.env.JWT_SECRET || 'schoolos_secret_key_123';
         WHERE teacher_id IS NOT NULL AND subject_id IS NOT NULL
       `);
     }
+
+    // Ensure all 3 terms exist for the active session
+    const activeSession = await query.get('SELECT id FROM sessions WHERE active = 1 LIMIT 1');
+    if (activeSession) {
+      const existingTerms = await query.all('SELECT name FROM terms WHERE session_id = ?', [activeSession.id]);
+      const termNames = existingTerms.map(t => t.name);
+      if (!termNames.includes('First Term')) {
+        await query.run('INSERT INTO terms (session_id, name, active) VALUES (?, ?, 0)', [activeSession.id, 'First Term']);
+      }
+      if (!termNames.includes('Second Term')) {
+        await query.run('INSERT INTO terms (session_id, name, active) VALUES (?, ?, 0)', [activeSession.id, 'Second Term']);
+      }
+      if (!termNames.includes('Third Term')) {
+        await query.run('INSERT INTO terms (session_id, name, active) VALUES (?, ?, 0)', [activeSession.id, 'Third Term']);
+      }
+      // If there is no active term, set First Term as active
+      const activeTerm = await query.get('SELECT id FROM terms WHERE active = 1');
+      if (!activeTerm) {
+        await query.run("UPDATE terms SET active = 1 WHERE name = 'First Term' AND session_id = ?", [activeSession.id]);
+        console.log("Migration: Set 'First Term' as active term.");
+      }
+    }
   } catch (err) {
     console.error("Migration error:", err);
   }
@@ -239,6 +261,43 @@ app.get('/api/school/info', async (req, res) => {
       session,
       term
     });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get all terms
+app.get('/api/terms', async (req, res) => {
+  try {
+    const activeSession = await query.get('SELECT id FROM sessions WHERE active = 1 LIMIT 1');
+    if (!activeSession) return res.status(404).json({ message: 'No active session found' });
+    const terms = await query.all('SELECT * FROM terms WHERE session_id = ?', [activeSession.id]);
+    res.json(terms);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Update active term
+app.put('/api/terms/active', async (req, res) => {
+  const { termId } = req.body;
+  if (!termId) return res.status(400).json({ message: 'termId is required' });
+
+  try {
+    const activeSession = await query.get('SELECT id FROM sessions WHERE active = 1 LIMIT 1');
+    if (!activeSession) return res.status(404).json({ message: 'No active session found' });
+
+    // Verify term belongs to active session
+    const term = await query.get('SELECT id FROM terms WHERE id = ? AND session_id = ?', [termId, activeSession.id]);
+    if (!term) return res.status(404).json({ message: 'Term not found in active session' });
+
+    // Set all other terms to inactive, and this one to active
+    await query.run('UPDATE terms SET active = 0 WHERE session_id = ?', [activeSession.id]);
+    await query.run('UPDATE terms SET active = 1 WHERE id = ?', [termId]);
+
+    res.json({ message: 'Active term updated successfully' });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Server error' });
