@@ -315,14 +315,85 @@ app.post('/api/auth/accept-invitation', async (req, res) => {
   }
 });
 
+app.post('/api/auth/register-proprietor', async (req, res) => {
+  const { name, email, password, phone, address, schoolName, schoolTagline } = req.body;
+
+  if (!name || !email || !password || !schoolName) {
+    return res.status(400).json({ message: 'Proprietor name, email, password, and school name are required' });
+  }
+
+  try {
+    const existingUser = await query.get('SELECT id FROM users WHERE email = ?', [email]);
+    if (existingUser) {
+      return res.status(400).json({ message: 'Email already registered' });
+    }
+
+    const schoolResult = await query.run(`
+      INSERT INTO schools (name, tagline, address, phone)
+      VALUES (?, ?, ?, ?)
+    `, [schoolName, schoolTagline || '', address || '', phone || '']);
+    const schoolId = schoolResult.id;
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    await query.run(`
+      INSERT INTO users (school_id, name, email, password, role, phone, address)
+      VALUES (?, ?, ?, ?, 'admin', ?, ?)
+    `, [schoolId, name, email, hashedPassword, phone || '', address || '']);
+
+    const sessionResult = await query.run(`
+      INSERT INTO sessions (school_id, name, active)
+      VALUES (?, '2025/2026 Academic Session', 1)
+    `, [schoolId]);
+
+    await query.run(`
+      INSERT INTO terms (session_id, name, active)
+      VALUES (?, 'First Term', 1)
+    `, [sessionResult.id]);
+
+    const classJss1 = await query.run(`
+      INSERT INTO classes (school_id, name, level)
+      VALUES (?, 'JSS 1', 'secondary')
+    `, [schoolId]);
+    await query.run(`
+      INSERT INTO classes (school_id, name, level)
+      VALUES (?, 'JSS 2', 'secondary')
+    `, [schoolId]);
+
+    await query.run(`
+      INSERT INTO subjects (school_id, name, code)
+      VALUES (?, 'Mathematics', 'MTH101')
+    `, [schoolId]);
+    await query.run(`
+      INSERT INTO subjects (school_id, name, code)
+      VALUES (?, 'English Language', 'ENG101')
+    `, [schoolId]);
+
+    const term = await query.get('SELECT id FROM terms WHERE session_id = ? AND name = "First Term"', [sessionResult.id]);
+    if (term) {
+      await query.run(`
+        INSERT INTO fee_structures (class_id, term_id, fee_name, amount)
+        VALUES (?, ?, 'Tuition Fee', 150000)
+      `, [classJss1.id, term.id]);
+    }
+
+    res.status(201).json({ message: 'School and Proprietor account onboarded successfully!' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error during onboarding' });
+  }
+});
+
 // ----------------------------------------------------
 // 2. School Info
 // ----------------------------------------------------
 app.get('/api/school/info', async (req, res) => {
+  const schoolId = req.query.school_id || 1;
   try {
-    const school = await query.get('SELECT * FROM schools LIMIT 1');
-    const session = await query.get('SELECT * FROM sessions WHERE active = 1');
-    const term = await query.get('SELECT * FROM terms WHERE active = 1');
+    const school = await query.get('SELECT * FROM schools WHERE id = ?', [schoolId]);
+    const session = await query.get('SELECT * FROM sessions WHERE active = 1 AND school_id = ?', [schoolId]);
+    const term = session ? await query.get('SELECT * FROM terms WHERE active = 1 AND session_id = ?', [session.id]) : null;
 
     res.json({
       school,
@@ -337,8 +408,9 @@ app.get('/api/school/info', async (req, res) => {
 
 // Get all terms
 app.get('/api/terms', async (req, res) => {
+  const schoolId = req.query.school_id || 1;
   try {
-    const activeSession = await query.get('SELECT id FROM sessions WHERE active = 1 LIMIT 1');
+    const activeSession = await query.get('SELECT id FROM sessions WHERE active = 1 AND school_id = ? LIMIT 1', [schoolId]);
     if (!activeSession) return res.status(404).json({ message: 'No active session found' });
     const terms = await query.all('SELECT * FROM terms WHERE session_id = ?', [activeSession.id]);
     res.json(terms);
@@ -350,18 +422,17 @@ app.get('/api/terms', async (req, res) => {
 
 // Update active term
 app.put('/api/terms/active', async (req, res) => {
-  const { termId } = req.body;
+  const { termId, school_id } = req.body;
+  const schoolIdVal = school_id || 1;
   if (!termId) return res.status(400).json({ message: 'termId is required' });
 
   try {
-    const activeSession = await query.get('SELECT id FROM sessions WHERE active = 1 LIMIT 1');
+    const activeSession = await query.get('SELECT id FROM sessions WHERE active = 1 AND school_id = ? LIMIT 1', [schoolIdVal]);
     if (!activeSession) return res.status(404).json({ message: 'No active session found' });
 
-    // Verify term belongs to active session
     const term = await query.get('SELECT id FROM terms WHERE id = ? AND session_id = ?', [termId, activeSession.id]);
     if (!term) return res.status(404).json({ message: 'Term not found in active session' });
 
-    // Set all other terms to inactive, and this one to active
     await query.run('UPDATE terms SET active = 0 WHERE session_id = ?', [activeSession.id]);
     await query.run('UPDATE terms SET active = 1 WHERE id = ?', [termId]);
 
@@ -376,16 +447,18 @@ app.put('/api/terms/active', async (req, res) => {
 // 3. Proprietor / Admin Overview Stats
 // ----------------------------------------------------
 app.get('/api/admin/overview', async (req, res) => {
+  const schoolId = req.query.school_id || 1;
   try {
-    const totalStudents = await query.get('SELECT COUNT(*) as count FROM students');
-    const totalTeachers = await query.get('SELECT COUNT(*) as count FROM teachers');
+    const totalStudents = await query.get('SELECT COUNT(*) as count FROM students WHERE user_id IN (SELECT id FROM users WHERE school_id = ?)', [schoolId]);
+    const totalTeachers = await query.get('SELECT COUNT(*) as count FROM teachers WHERE user_id IN (SELECT id FROM users WHERE school_id = ?)', [schoolId]);
     const financialStats = await query.get(`
       SELECT 
         SUM(total_amount) as total_invoiced,
         SUM(paid_amount) as total_collected,
         SUM(total_amount - paid_amount) as outstanding_debt
       FROM invoices
-    `);
+      WHERE student_id IN (SELECT id FROM students WHERE user_id IN (SELECT id FROM users WHERE school_id = ?))
+    `, [schoolId]);
 
     res.json({
       students: totalStudents.count,
@@ -404,6 +477,7 @@ app.get('/api/admin/overview', async (req, res) => {
 // 4. Student Management
 // ----------------------------------------------------
 app.get('/api/students', async (req, res) => {
+  const schoolId = req.query.school_id || 1;
   try {
     const students = await query.all(`
       SELECT s.id as student_id, u.id as user_id, u.name, u.email, u.phone, 
@@ -411,7 +485,8 @@ app.get('/api/students', async (req, res) => {
       FROM students s
       JOIN users u ON s.user_id = u.id
       LEFT JOIN classes c ON s.class_id = c.id
-    `);
+      WHERE u.school_id = ?
+    `, [schoolId]);
     res.json(students);
   } catch (error) {
     console.error(error);
@@ -420,18 +495,18 @@ app.get('/api/students', async (req, res) => {
 });
 
 app.post('/api/students', async (req, res) => {
-  const { name, email, phone, class_id, guardian_name, guardian_phone } = req.body;
+  const { name, email, phone, class_id, guardian_name, guardian_phone, school_id } = req.body;
+  const schoolId = school_id || 1;
 
   try {
     const salt = await bcrypt.genSalt(10);
-    const password = await bcrypt.hash('password123', salt); // default password
-    const school = await query.get('SELECT id FROM schools LIMIT 1');
+    const password = await bcrypt.hash('password123', salt);
 
     // Create user
     const userResult = await query.run(`
       INSERT INTO users (school_id, name, email, password, role, phone)
       VALUES (?, ?, ?, ?, 'student', ?)
-    `, [school.id, name, email, password, phone]);
+    `, [schoolId, name, email, password, phone]);
 
     const user_id = userResult.id;
     const admission_no = 'ADM' + Date.now().toString().slice(-6);
@@ -443,7 +518,7 @@ app.post('/api/students', async (req, res) => {
     `, [user_id, class_id, admission_no, guardian_name, guardian_phone]);
 
     // Create invoice for default class fees
-    const activeTerm = await query.get('SELECT t.id FROM terms t JOIN sessions s ON t.session_id = s.id WHERE t.active = 1 LIMIT 1');
+    const activeTerm = await query.get('SELECT t.id FROM terms t JOIN sessions s ON t.session_id = s.id WHERE t.active = 1 AND s.school_id = ? LIMIT 1', [schoolId]);
     if (activeTerm) {
       const fees = await query.all('SELECT SUM(amount) as total FROM fee_structures WHERE class_id = ? AND term_id = ?', [class_id, activeTerm.id]);
       const totalAmount = fees[0].total || 0;
@@ -510,13 +585,15 @@ app.put('/api/students/:studentId', async (req, res) => {
 // 5. Staff Management
 // ----------------------------------------------------
 app.get('/api/teachers', async (req, res) => {
+  const schoolId = req.query.school_id || 1;
   try {
     const teachers = await query.all(`
       SELECT t.id as teacher_id, u.id as user_id, u.name, u.email, u.phone, u.role, u.active, u.invitation_status, t.employee_no, t.department, t.class_id, c.name as class_name
       FROM teachers t
       JOIN users u ON t.user_id = u.id
       LEFT JOIN classes c ON t.class_id = c.id
-    `);
+      WHERE u.school_id = ?
+    `, [schoolId]);
 
     for (let t of teachers) {
       const subjects = await query.all(`
@@ -545,7 +622,8 @@ app.get('/api/teachers', async (req, res) => {
 });
 
 app.post('/api/teachers', async (req, res) => {
-  const { name, email, phone, role, employee_no, department, class_id, class_subjects } = req.body;
+  const { name, email, phone, role, employee_no, department, class_id, class_subjects, school_id } = req.body;
+  const schoolId = school_id || 1;
 
   if (!name || !email || !role || !employee_no) {
     return res.status(400).json({ message: 'Name, email, role, and employee number are required' });
@@ -570,13 +648,12 @@ app.post('/api/teachers', async (req, res) => {
 
     const salt = await bcrypt.genSalt(10);
     const password = await bcrypt.hash('password123', salt); // default password
-    const school = await query.get('SELECT id FROM schools LIMIT 1');
 
     // Create user
     const userResult = await query.run(`
       INSERT INTO users (school_id, name, email, password, role, phone, invitation_status)
       VALUES (?, ?, ?, ?, ?, ?, 'pending')
-    `, [school.id, name, email, password, role, phone]);
+    `, [schoolId, name, email, password, role, phone]);
 
     const user_id = userResult.id;
 
@@ -685,13 +762,15 @@ app.put('/api/teachers/:teacherId', async (req, res) => {
 // 6. Academic Configurations (Classes, Subjects)
 // ----------------------------------------------------
 app.get('/api/classes', async (req, res) => {
+  const schoolId = req.query.school_id || 1;
   try {
     const classes = await query.all(`
       SELECT c.*, u.name as class_teacher_name 
       FROM classes c 
       LEFT JOIN teachers t ON c.id = t.class_id
       LEFT JOIN users u ON t.user_id = u.id
-    `);
+      WHERE c.school_id = ?
+    `, [schoolId]);
     res.json(classes);
   } catch (error) {
     console.error(error);
@@ -700,12 +779,12 @@ app.get('/api/classes', async (req, res) => {
 });
 
 app.post('/api/classes', async (req, res) => {
-  const { name, level } = req.body;
+  const { name, level, school_id } = req.body;
+  const schoolId = school_id || 1;
   try {
-    const school = await query.get('SELECT id FROM schools LIMIT 1');
     const result = await query.run(`
       INSERT INTO classes (school_id, name, level) VALUES (?, ?, ?)
-    `, [school.id, name, level]);
+    `, [schoolId, name, level]);
     res.status(201).json({ id: result.id, name, level });
   } catch (error) {
     console.error(error);
@@ -745,8 +824,9 @@ app.delete('/api/classes/:id', async (req, res) => {
 });
 
 app.get('/api/subjects', async (req, res) => {
+  const schoolId = req.query.school_id || 1;
   try {
-    const subjects = await query.all('SELECT * FROM subjects');
+    const subjects = await query.all('SELECT * FROM subjects WHERE school_id = ?', [schoolId]);
     res.json(subjects);
   } catch (error) {
     console.error(error);
@@ -755,12 +835,12 @@ app.get('/api/subjects', async (req, res) => {
 });
 
 app.post('/api/subjects', async (req, res) => {
-  const { name, code } = req.body;
+  const { name, code, school_id } = req.body;
+  const schoolId = school_id || 1;
   try {
-    const school = await query.get('SELECT id FROM schools LIMIT 1');
     const result = await query.run(`
       INSERT INTO subjects (school_id, name, code) VALUES (?, ?, ?)
-    `, [school.id, name, code]);
+    `, [schoolId, name, code]);
     res.status(201).json({ id: result.id, name, code });
   } catch (error) {
     console.error(error);
