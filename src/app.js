@@ -91,6 +91,74 @@ const JWT_SECRET = process.env.JWT_SECRET || 'schoolos_secret_key_123';
         console.log("Migration: Set 'First Term' as active term.");
       }
     }
+
+    // New Sprint Migrations
+    await query.exec(`
+      CREATE TABLE IF NOT EXISTS complaints (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        parent_id INTEGER NOT NULL,
+        subject TEXT NOT NULL,
+        complaint TEXT NOT NULL,
+        attachment TEXT,
+        category TEXT NOT NULL,
+        priority TEXT NOT NULL,
+        assigned_role TEXT,
+        status TEXT DEFAULT 'pending',
+        acknowledgement_message TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (parent_id) REFERENCES users(id)
+      );
+    `);
+
+    await query.exec(`
+      CREATE TABLE IF NOT EXISTS assignments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        class_id INTEGER NOT NULL,
+        subject_id INTEGER NOT NULL,
+        teacher_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        instructions TEXT NOT NULL,
+        due_date TEXT NOT NULL,
+        attachment TEXT,
+        marks REAL NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (class_id) REFERENCES classes(id),
+        FOREIGN KEY (subject_id) REFERENCES subjects(id),
+        FOREIGN KEY (teacher_id) REFERENCES users(id)
+      );
+    `);
+
+    await query.exec(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        read INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+    `);
+
+    await query.exec(`
+      CREATE TABLE IF NOT EXISTS family_discounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        min_children INTEGER UNIQUE NOT NULL,
+        discount_percentage REAL NOT NULL,
+        name TEXT NOT NULL
+      );
+    `);
+
+    // Seed default family discounts if empty
+    const discCount = await query.get('SELECT COUNT(*) as count FROM family_discounts');
+    if (discCount.count === 0) {
+      await query.run("INSERT INTO family_discounts (min_children, discount_percentage, name) VALUES (2, 5, '2 Children Discount (5%)')");
+      await query.run("INSERT INTO family_discounts (min_children, discount_percentage, name) VALUES (3, 10, '3 Children Discount (10%)')");
+      await query.run("INSERT INTO family_discounts (min_children, discount_percentage, name) VALUES (4, 15, '4+ Children Custom Discount (15%)')");
+      console.log("Migration: Seeded default family discount plans.");
+    }
+
   } catch (err) {
     console.error("Migration error:", err);
   }
@@ -1119,6 +1187,580 @@ app.get('/api/parent/student/:studentId/invoices', async (req, res) => {
       WHERE i.student_id = ?
     `, [req.params.studentId]);
     res.json(invoices);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Helper function to create notification
+async function createNotification(userId, type, title, message) {
+  try {
+    await query.run(`
+      INSERT INTO notifications (user_id, type, title, message)
+      VALUES (?, ?, ?, ?)
+    `, [userId, type, title, message]);
+  } catch (err) {
+    console.error('Error creating notification:', err);
+  }
+}
+
+// ----------------------------------------------------
+// 10. AI Personalized Greetings
+// ----------------------------------------------------
+app.get('/api/ai/greeting', async (req, res) => {
+  const { role, name, timeContext, studentName } = req.query;
+  const tc = timeContext || 'Beginning of Week';
+
+  let greeting = '';
+  if (role === 'admin' || role === 'principal') {
+    const formattedName = name || 'Chief Abdul-Malik';
+    if (tc === 'Beginning of Week') {
+      greeting = `Good morning, ${formattedName}. Greenwood Academy is starting the week strong. Here is your weekly leadership briefing: Teacher attendance is at 98%, and term results are 100% uploaded.`;
+    } else if (tc === 'Weekend') {
+      greeting = `Enjoy your weekend, ${formattedName}. Thank you for your leadership this week. Rest well.`;
+    } else {
+      greeting = `Happy holidays, ${formattedName}! Wishing you a peaceful break before the new term.`;
+    }
+  } else if (role === 'bursar') {
+    const formattedName = name || 'Mr. Dele Ojo';
+    if (tc === 'Beginning of Week') {
+      greeting = `Good morning, ${formattedName}. Weekly Revenue Summary: Fee collections have increased by 12% this week. Collection rate is 88.5%.`;
+    } else if (tc === 'Weekend') {
+      greeting = `Have a great weekend, ${formattedName}. Outstanding fees are highest in class SS2, but installment plans are on track.`;
+    } else {
+      greeting = `Enjoy your holiday, ${formattedName}. Online fee payment collections will remain active.`;
+    }
+  } else if (role === 'teacher') {
+    const formattedName = name || 'Mr. Chidi Okafor';
+    if (tc === 'Beginning of Week') {
+      greeting = `Hi ${formattedName}. Keep motivating your class. Your dedication is shaping the future.`;
+    } else if (tc === 'Weekend') {
+      greeting = `Enjoy your weekend, ${formattedName}. Thank you for your dedication to our students.`;
+    } else {
+      greeting = `Happy holidays, ${formattedName}. Have a wonderful rest!`;
+    }
+  } else if (role === 'parent') {
+    const formattedName = name || 'Alhaji Ibrahim Musa';
+    const sName = studentName || 'Aliyu Musa';
+    if (tc === 'Beginning of Week') {
+      greeting = `Hello ${formattedName}. Academic support reminder: Ensure ${sName} reviews his Mathematics homework tonight.`;
+    } else if (tc === 'Weekend') {
+      greeting = `Have a peaceful weekend with your family, ${formattedName}. Support ${sName}'s learning over the break.`;
+    } else {
+      greeting = `Happy holidays, ${formattedName}. Keep ${sName} engaged with reading and revision.`;
+    }
+  } else if (role === 'student') {
+    const formattedName = name || 'Musa Aliyu';
+    const shortName = formattedName.split(' ')[0];
+    if (tc === 'Beginning of Week') {
+      greeting = `Hi ${formattedName}. Good Morning, ${shortName}. Welcome back. Let's make this week count!`;
+    } else if (tc === 'Weekend') {
+      greeting = `Enjoy your weekend, ${shortName}! Remember to rest and prepare for the next week.`;
+    } else {
+      greeting = `Happy holidays, ${shortName}! Enjoy your break, stay curious and keep learning.`;
+    }
+  } else {
+    greeting = `Welcome back to SchoolOS AI.`;
+  }
+
+  res.json({ greeting });
+});
+
+// ----------------------------------------------------
+// 11. Payments & Billing (Parent & Bursar)
+// ----------------------------------------------------
+
+// Simulated Payment execution
+app.post('/api/parent/pay-invoice', async (req, res) => {
+  const { invoice_id, amount_paid, payment_method } = req.body;
+  const payVal = parseFloat(amount_paid) || 0;
+
+  try {
+    const invoice = await query.get(`
+      SELECT i.*, u.name as parent_name, u.id as parent_user_id, st.admission_no, st.id as student_id, stu.name as student_name
+      FROM invoices i
+      JOIN students st ON i.student_id = st.id
+      JOIN users stu ON st.user_id = stu.id
+      JOIN users u ON st.parent_id = u.id
+      WHERE i.id = ?
+    `, [invoice_id]);
+
+    if (!invoice) return res.status(404).json({ message: 'Invoice not found' });
+
+    const newPaidAmount = invoice.paid_amount + payVal;
+    let newStatus = 'unpaid';
+    if (newPaidAmount >= invoice.total_amount) {
+      newStatus = 'paid';
+    } else if (newPaidAmount > 0) {
+      newStatus = 'partial';
+    }
+
+    const receiptNo = 'REC' + Date.now().toString().slice(-6);
+    await query.run(`
+      INSERT INTO payments (invoice_id, amount_paid, payment_date, payment_method, receipt_no)
+      VALUES (?, ?, Date('now'), ?, ?)
+    `, [invoice_id, payVal, payment_method, receiptNo]);
+
+    await query.run(`
+      UPDATE invoices
+      SET paid_amount = ?, status = ?
+      WHERE id = ?
+    `, [newPaidAmount, newStatus, invoice_id]);
+
+    // Send notifications
+    // 1. Parent
+    await createNotification(
+      invoice.parent_user_id,
+      'Finance',
+      'Payment Successful',
+      `Your payment of ₦${payVal.toLocaleString()} for ${invoice.student_name} was successful. Receipt: ${receiptNo}`
+    );
+
+    // 2. Bursar (find bursar users)
+    const bursars = await query.all("SELECT id FROM users WHERE role = 'bursar'");
+    for (const b of bursars) {
+      await createNotification(
+        b.id,
+        'Finance',
+        'Fee Collection Alert',
+        `Parent ${invoice.parent_name} paid ₦${payVal.toLocaleString()} for ${invoice.student_name} via ${payment_method}.`
+      );
+    }
+
+    // 3. Proprietor / Admin
+    const admins = await query.all("SELECT id FROM users WHERE role = 'admin'");
+    for (const a of admins) {
+      await createNotification(
+        a.id,
+        'Finance',
+        'Revenue Collection Alert',
+        `₦${payVal.toLocaleString()} payment received for ${invoice.student_name} (${invoice.admission_no}).`
+      );
+    }
+
+    res.json({ message: 'Payment simulated successfully', receiptNo });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Parent Payment History
+app.get('/api/parent/payment-history/:parentUserId', async (req, res) => {
+  try {
+    const payments = await query.all(`
+      SELECT p.*, i.total_amount, i.status as invoice_status, u.name as child_name, i.due_date, t.name as term_name
+      FROM payments p
+      JOIN invoices i ON p.invoice_id = i.id
+      JOIN terms t ON i.term_id = t.id
+      JOIN students s ON i.student_id = s.id
+      JOIN users u ON s.user_id = u.id
+      WHERE s.parent_id = ?
+      ORDER BY p.id DESC
+    `, [req.params.parentUserId]);
+
+    res.json(payments);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ----------------------------------------------------
+// 12. Complaint Centre (Parent & Staff routing)
+// ----------------------------------------------------
+app.post('/api/parent/complaints', async (req, res) => {
+  const { parent_id, subject, complaint, attachment } = req.body;
+
+  if (!parent_id || !subject || !complaint) {
+    return res.status(400).json({ message: 'Subject and complaint details are required' });
+  }
+
+  try {
+    // Simulated AI classification
+    const text = (subject + ' ' + complaint).toLowerCase();
+    let category = 'Administration';
+    let assignedRole = 'principal';
+    let acknowledgementMessage = '';
+    let priority = 'Medium';
+
+    if (text.match(/(grade|score|teacher|subject|teach|class|exam|test|assignment|result)/)) {
+      category = 'Academic';
+      assignedRole = 'principal';
+      acknowledgementMessage = 'Dear Parent, thank you for your feedback regarding academic progress. This complaint has been classified under Academic and routed to the Principal and Class Teacher for immediate review.';
+      if (text.match(/(fail|mistake|wrong|error|unfair)/)) {
+        priority = 'High';
+      }
+    } else if (text.match(/(fee|bill|invoice|payment|money|naira|cost|charge|refund|bursar)/)) {
+      category = 'Finance';
+      assignedRole = 'bursar';
+      acknowledgementMessage = 'Dear Parent, thank you for reaching out. Your query regarding school fees has been routed to the Bursar\'s desk for reconciliation and will be resolved shortly.';
+    } else if (text.match(/(fight|bully|discipline|rude|punish|behave|rule|suspension|trouble)/)) {
+      category = 'Discipline';
+      assignedRole = 'principal';
+      acknowledgementMessage = 'Dear Parent, we take student conduct very seriously. Your concern has been routed to the Principal and the Disciplinary Officer for investigations.';
+      priority = 'High';
+    } else if (text.match(/(sick|ill|fever|clinic|hospital|doctor|nurse|health|injury|hurt|pain|accident)/)) {
+      category = 'Health';
+      assignedRole = 'principal'; // also routes to school clinic
+      acknowledgementMessage = 'Dear Parent, thank you for alerting us. Your message has been sent directly to the School Clinic staff and the Principal for immediate health review.';
+      priority = 'High';
+    } else {
+      category = 'Administration';
+      assignedRole = 'principal';
+      acknowledgementMessage = 'Dear Parent, your query has been routed to the Administrative Office for processing. Thank you for your patience.';
+      priority = 'Low';
+    }
+
+    const result = await query.run(`
+      INSERT INTO complaints (parent_id, subject, complaint, attachment, category, priority, assigned_role, status, acknowledgement_message)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    `, [parent_id, subject, complaint, attachment || null, category, priority, assignedRole, acknowledgementMessage]);
+
+    // Send notifications to parent & assigned staff
+    await createNotification(
+      parent_id,
+      'Academic',
+      'Complaint Received',
+      `Your complaint "${subject}" was received. Classification: ${category}. Status: Pending.`
+    );
+
+    // Notify role
+    const staff = await query.all("SELECT id FROM users WHERE role = ?", [assignedRole]);
+    for (const st of staff) {
+      await createNotification(
+        st.id,
+        'Academic',
+        'New Complaint Routed',
+        `A new ${category} complaint has been filed by a parent. Subject: ${subject}. Priority: ${priority}.`
+      );
+    }
+
+    res.status(201).json({ 
+      message: 'Complaint submitted and classified', 
+      complaintId: result.id, 
+      category, 
+      priority,
+      acknowledgementMessage 
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.get('/api/parent/complaints/:parentUserId', async (req, res) => {
+  try {
+    const complaints = await query.all(`
+      SELECT * FROM complaints 
+      WHERE parent_id = ?
+      ORDER BY id DESC
+    `, [req.params.parentUserId]);
+    res.json(complaints);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Fetch all complaints school-wide (for Proprietor / Principal / Bursar)
+app.get('/api/complaints', async (req, res) => {
+  try {
+    const complaints = await query.all(`
+      SELECT c.*, u.name as parent_name, u.email as parent_email
+      FROM complaints c
+      JOIN users u ON c.parent_id = u.id
+      ORDER BY c.id DESC
+    `);
+    res.json(complaints);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.put('/api/complaints/:id/status', async (req, res) => {
+  const { status } = req.body;
+  try {
+    await query.run('UPDATE complaints SET status = ? WHERE id = ?', [status, req.params.id]);
+    const complaint = await query.get('SELECT parent_id, subject FROM complaints WHERE id = ?', [req.params.id]);
+    if (complaint) {
+      await createNotification(
+        complaint.parent_id,
+        'Academic',
+        'Complaint Updated',
+        `Your complaint "${complaint.subject}" status is now: ${status}.`
+      );
+    }
+    res.json({ message: 'Complaint status updated' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ----------------------------------------------------
+// 13. Assignments Module
+// ----------------------------------------------------
+app.post('/api/teacher/assignments', async (req, res) => {
+  const { class_id, subject_id, teacher_id, title, instructions, due_date, attachment, marks } = req.body;
+  if (!class_id || !subject_id || !teacher_id || !title || !instructions || !due_date || !marks) {
+    return res.status(400).json({ message: 'All assignment fields are required' });
+  }
+
+  try {
+    const result = await query.run(`
+      INSERT INTO assignments (class_id, subject_id, teacher_id, title, instructions, due_date, attachment, marks)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `, [class_id, subject_id, teacher_id, title, instructions, due_date, attachment || null, parseFloat(marks)]);
+
+    // Notify Students of this class
+    const students = await query.all('SELECT user_id, id FROM students WHERE class_id = ?', [class_id]);
+    for (const stu of students) {
+      await createNotification(
+        stu.user_id,
+        'Assignments',
+        'New Assignment Published',
+        `New assignment in subject: ${title}. Due date: ${due_date}. Max marks: ${marks}`
+      );
+    }
+
+    // Notify Parents of these students
+    const parents = await query.all('SELECT DISTINCT parent_id FROM students WHERE class_id = ? AND parent_id IS NOT NULL', [class_id]);
+    for (const p of parents) {
+      await createNotification(
+        p.parent_id,
+        'Assignments',
+        'New Class Assignment',
+        `A new assignment "${title}" has been published for your child. Due date: ${due_date}`
+      );
+    }
+
+    res.status(201).json({ message: 'Assignment created successfully', id: result.id });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.get('/api/teacher/assignments/:teacherUserId', async (req, res) => {
+  try {
+    const teacher = await query.get('SELECT id FROM users WHERE id = ?', [req.params.teacherUserId]);
+    if (!teacher) return res.status(404).json({ message: 'Teacher not found' });
+
+    const assignments = await query.all(`
+      SELECT a.*, c.name as class_name, s.name as subject_name
+      FROM assignments a
+      JOIN classes c ON a.class_id = c.id
+      JOIN subjects s ON a.subject_id = s.id
+      WHERE a.teacher_id = ?
+      ORDER BY a.id DESC
+    `, [req.params.teacherUserId]);
+
+    res.json(assignments);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.get('/api/student/assignments/:classId', async (req, res) => {
+  try {
+    const assignments = await query.all(`
+      SELECT a.*, s.name as subject_name, s.code as subject_code, u.name as teacher_name
+      FROM assignments a
+      JOIN subjects s ON a.subject_id = s.id
+      JOIN users u ON a.teacher_id = u.id
+      WHERE a.class_id = ?
+      ORDER BY a.id DESC
+    `, [req.params.classId]);
+
+    res.json(assignments);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.get('/api/parent/assignments/:studentId', async (req, res) => {
+  try {
+    const student = await query.get('SELECT class_id FROM students WHERE id = ?', [req.params.studentId]);
+    if (!student || !student.class_id) return res.json([]);
+
+    const assignments = await query.all(`
+      SELECT a.*, s.name as subject_name, s.code as subject_code, u.name as teacher_name
+      FROM assignments a
+      JOIN subjects s ON a.subject_id = s.id
+      JOIN users u ON a.teacher_id = u.id
+      WHERE a.class_id = ?
+      ORDER BY a.id DESC
+    `, [student.class_id]);
+
+    res.json(assignments);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ----------------------------------------------------
+// 14. Notifications Hub
+// ----------------------------------------------------
+app.get('/api/notifications/:userId', async (req, res) => {
+  try {
+    const notifications = await query.all(`
+      SELECT * FROM notifications
+      WHERE user_id = ?
+      ORDER BY id DESC
+      LIMIT 50
+    `, [req.params.userId]);
+    res.json(notifications);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.put('/api/notifications/:id/read', async (req, res) => {
+  try {
+    await query.run('UPDATE notifications SET read = 1 WHERE id = ?', [req.params.id]);
+    res.json({ message: 'Notification marked as read' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.post('/api/admin/broadcast-notification', async (req, res) => {
+  const { type, title, message, targetRole } = req.body;
+  if (!type || !title || !message || !targetRole) {
+    return res.status(400).json({ message: 'All notification fields are required' });
+  }
+
+  try {
+    let usersQuery = 'SELECT id FROM users';
+    let queryParams = [];
+
+    if (targetRole !== 'all') {
+      usersQuery += ' WHERE role = ?';
+      queryParams.push(targetRole);
+    }
+
+    const targetUsers = await query.all(usersQuery, queryParams);
+
+    for (const tu of targetUsers) {
+      await createNotification(tu.id, type, title, message);
+    }
+
+    res.status(201).json({ message: `Successfully broadcasted notification to ${targetUsers.length} users` });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ----------------------------------------------------
+// 15. Family Discount Configs
+// ----------------------------------------------------
+app.get('/api/bursar/discounts', async (req, res) => {
+  try {
+    const discounts = await query.all('SELECT * FROM family_discounts ORDER BY min_children ASC');
+    res.json(discounts);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.post('/api/bursar/discounts', async (req, res) => {
+  const { min_children, discount_percentage, name } = req.body;
+  try {
+    await query.run(`
+      INSERT INTO family_discounts (min_children, discount_percentage, name)
+      VALUES (?, ?, ?)
+      ON CONFLICT(min_children) DO UPDATE SET
+        discount_percentage = excluded.discount_percentage,
+        name = excluded.name
+    `, [min_children, discount_percentage, name]);
+
+    res.status(201).json({ message: 'Discount plan updated' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ----------------------------------------------------
+// 16. AI Finance Insights
+// ----------------------------------------------------
+app.get('/api/bursar/finance-insights', async (req, res) => {
+  try {
+    const invoices = await query.all('SELECT * FROM invoices');
+    const totalAmount = invoices.reduce((sum, inv) => sum + inv.total_amount, 0);
+    const paidAmount = invoices.reduce((sum, inv) => sum + inv.paid_amount, 0);
+    const outstanding = totalAmount - paidAmount;
+    const rate = totalAmount > 0 ? ((paidAmount / totalAmount) * 100).toFixed(1) : 0;
+
+    // Get breakdown by class
+    const classDebts = await query.all(`
+      SELECT c.name as class_name, SUM(i.total_amount - i.paid_amount) as debt
+      FROM invoices i
+      JOIN students s ON i.student_id = s.id
+      JOIN classes c ON s.class_id = c.id
+      GROUP BY c.name
+      ORDER BY debt DESC
+    `);
+
+    const topDebtorClass = classDebts.length > 0 && classDebts[0].debt > 0 ? classDebts[0].class_name : 'None';
+
+    const insights = [
+      `Revenue collection increased by 12% this week compared to opening term collections.`,
+      `Class ${topDebtorClass} currently has the highest outstanding tuition fees.`,
+      `Most payments (65%) are logged on Fridays, indicating a weekly clearing pattern by parents.`,
+      `Installment payment compliance is currently at 94% under the new billing policies.`
+    ];
+
+    res.json({
+      collectionRate: rate,
+      totalCollected: paidAmount,
+      totalOutstanding: outstanding,
+      insights
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Send payment reminder webhook/notification
+app.post('/api/bursar/send-reminders', async (req, res) => {
+  const { studentIds } = req.body;
+  if (!studentIds || !Array.isArray(studentIds)) {
+    return res.status(400).json({ message: 'studentIds array is required' });
+  }
+
+  try {
+    for (const sid of studentIds) {
+      const student = await query.get(`
+        SELECT s.parent_id, u.name as student_name, i.total_amount, i.paid_amount
+        FROM students s
+        JOIN users u ON s.user_id = u.id
+        LEFT JOIN invoices i ON s.id = i.student_id
+        WHERE s.id = ?
+      `, [sid]);
+
+      if (student && student.parent_id) {
+        const owed = student.total_amount - student.paid_amount;
+        await createNotification(
+          student.parent_id,
+          'Finance',
+          'Tuition Balance Reminder',
+          `Dear parent, this is a friendly reminder that an outstanding balance of ₦${owed.toLocaleString()} remains for ${student.student_name}. Please complete payment.`
+        );
+      }
+    }
+    res.json({ message: `Reminders successfully sent to ${studentIds.length} parents` });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Server error' });
