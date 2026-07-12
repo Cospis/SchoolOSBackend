@@ -231,6 +231,7 @@ app.post('/api/auth/login', async (req, res) => {
       token,
       user: {
         id: user.id,
+        school_id: user.school_id,
         name: user.name,
         email: user.email,
         role: user.role,
@@ -301,6 +302,7 @@ app.post('/api/auth/accept-invitation', async (req, res) => {
       token,
       user: {
         id: user.id,
+        school_id: user.school_id,
         name: user.name,
         email: user.email,
         role: user.role,
