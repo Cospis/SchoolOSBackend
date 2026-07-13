@@ -850,6 +850,72 @@ app.post('/api/subjects', async (req, res) => {
   }
 });
 
+// Bulk Import Subjects
+app.post('/api/subjects/import', async (req, res) => {
+  const { subjects, school_id } = req.body;
+  const schoolId = school_id || 1;
+
+  if (!subjects || !Array.isArray(subjects)) {
+    return res.status(400).json({ message: 'Subjects array is required' });
+  }
+
+  const results = {
+    successful: [],
+    failed: []
+  };
+
+  try {
+    for (let index = 0; index < subjects.length; index++) {
+      const row = subjects[index];
+      const { name, code } = row;
+
+      if (!name || !code) {
+        results.failed.push({
+          row: index + 1,
+          name: name || 'Unknown',
+          reason: 'Subject name and subject code are required.'
+        });
+        continue;
+      }
+
+      const existingSubject = await query.get('SELECT id FROM subjects WHERE school_id = ? AND (code = ? OR name = ?)', [schoolId, code, name]);
+      if (existingSubject) {
+        results.failed.push({
+          row: index + 1,
+          name,
+          reason: `Subject with code '${code}' or name '${name}' already exists.`
+        });
+        continue;
+      }
+
+      try {
+        const result = await query.run(`
+          INSERT INTO subjects (school_id, name, code) VALUES (?, ?, ?)
+        `, [schoolId, name, code]);
+
+        results.successful.push({
+          row: index + 1,
+          name,
+          code,
+          id: result.id
+        });
+      } catch (err) {
+        results.failed.push({
+          row: index + 1,
+          name,
+          reason: err.message
+        });
+      }
+    }
+
+    res.json(results);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error during subject import' });
+  }
+});
+
+
 app.put('/api/subjects/:id', async (req, res) => {
   const { id } = req.params;
   const { name, code } = req.body;
@@ -1850,8 +1916,264 @@ app.post('/api/bursar/send-reminders', async (req, res) => {
 });
 
 // ----------------------------------------------------
+// Bulk Import Endpoints
+// ----------------------------------------------------
+
+// Bulk Import Students
+app.post('/api/students/import', async (req, res) => {
+  const { students, school_id } = req.body;
+  const schoolId = school_id || 1;
+
+  if (!students || !Array.isArray(students)) {
+    return res.status(400).json({ message: 'Students array is required' });
+  }
+
+  const results = {
+    successful: [],
+    failed: []
+  };
+
+  try {
+    const salt = await bcrypt.genSalt(10);
+    const password = await bcrypt.hash('password123', salt);
+
+    // Fetch classes for lookup
+    const classes = await query.all('SELECT id, name FROM classes WHERE school_id = ?', [schoolId]);
+    const classMap = {};
+    classes.forEach(c => {
+      classMap[c.name.toLowerCase().trim()] = c.id;
+    });
+
+    const activeTerm = await query.get('SELECT t.id FROM terms t JOIN sessions s ON t.session_id = s.id WHERE t.active = 1 AND s.school_id = ? LIMIT 1', [schoolId]);
+
+    for (let index = 0; index < students.length; index++) {
+      const row = students[index];
+      const { name, email, phone, class_name, guardian_name, guardian_phone } = row;
+
+      if (!name || !email) {
+        results.failed.push({
+          row: index + 1,
+          name: name || 'Unknown',
+          reason: 'Name and email are required.'
+        });
+        continue;
+      }
+
+      // Check email uniqueness
+      const existingUser = await query.get('SELECT id FROM users WHERE email = ?', [email]);
+      if (existingUser) {
+        results.failed.push({
+          row: index + 1,
+          name,
+          reason: `Email '${email}' is already registered.`
+        });
+        continue;
+      }
+
+      // Look up class_id
+      let class_id = null;
+      if (class_name) {
+        class_id = classMap[class_name.toLowerCase().trim()] || null;
+        if (!class_id) {
+          results.failed.push({
+            row: index + 1,
+            name,
+            reason: `Class '${class_name}' does not exist.`
+          });
+          continue;
+        }
+      }
+
+      try {
+        // Insert user
+        const userResult = await query.run(`
+          INSERT INTO users (school_id, name, email, password, role, phone)
+          VALUES (?, ?, ?, ?, 'student', ?)
+        `, [schoolId, name, email, password, phone || null]);
+
+        const user_id = userResult.id;
+        const admission_no = 'ADM' + Date.now().toString().slice(-6) + index;
+
+        // Create student profile
+        const studentResult = await query.run(`
+          INSERT INTO students (user_id, class_id, admission_no, guardian_name, guardian_phone)
+          VALUES (?, ?, ?, ?, ?)
+        `, [user_id, class_id, admission_no, guardian_name || null, guardian_phone || null]);
+
+        // Create invoice for default class fees
+        if (class_id && activeTerm) {
+          const fees = await query.all('SELECT SUM(amount) as total FROM fee_structures WHERE class_id = ? AND term_id = ?', [class_id, activeTerm.id]);
+          const totalAmount = fees[0].total || 0;
+
+          if (totalAmount > 0) {
+            await query.run(`
+              INSERT INTO invoices (student_id, term_id, total_amount, paid_amount, status, due_date)
+              VALUES (?, ?, ?, 0, 'unpaid', '2026-07-30')
+            `, [studentResult.id, activeTerm.id, totalAmount]);
+          }
+        }
+
+        results.successful.push({
+          row: index + 1,
+          name,
+          admission_no
+        });
+      } catch (err) {
+        results.failed.push({
+          row: index + 1,
+          name,
+          reason: err.message
+        });
+      }
+    }
+
+    res.json(results);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error during student import' });
+  }
+});
+
+// Bulk Import Teachers & Staff
+app.post('/api/teachers/import', async (req, res) => {
+  const { staff, school_id } = req.body;
+  const schoolId = school_id || 1;
+
+  if (!staff || !Array.isArray(staff)) {
+    return res.status(400).json({ message: 'Staff array is required' });
+  }
+
+  const results = {
+    successful: [],
+    failed: []
+  };
+
+  try {
+    const salt = await bcrypt.genSalt(10);
+    const password = await bcrypt.hash('password123', salt);
+
+    // Fetch classes for lookup
+    const classes = await query.all('SELECT id, name FROM classes WHERE school_id = ?', [schoolId]);
+    const classMap = {};
+    classes.forEach(c => {
+      classMap[c.name.toLowerCase().trim()] = c.id;
+    });
+
+    for (let index = 0; index < staff.length; index++) {
+      const row = staff[index];
+      const { name, email, phone, role, employee_no, department, class_name } = row;
+
+      if (!name || !email || !role || !employee_no) {
+        results.failed.push({
+          row: index + 1,
+          name: name || 'Unknown',
+          reason: 'Name, email, role, and employee number are required.'
+        });
+        continue;
+      }
+
+      const cleanRole = role.toLowerCase().trim();
+      if (!['teacher', 'principal', 'bursar'].includes(cleanRole)) {
+        results.failed.push({
+          row: index + 1,
+          name,
+          reason: `Invalid role '${role}'. Role must be one of: teacher, principal, bursar.`
+        });
+        continue;
+      }
+
+      // Check email uniqueness
+      const existingUser = await query.get('SELECT id FROM users WHERE email = ?', [email]);
+      if (existingUser) {
+        results.failed.push({
+          row: index + 1,
+          name,
+          reason: `Email '${email}' is already registered.`
+        });
+        continue;
+      }
+
+      // Check employee number uniqueness
+      const existingEmp = await query.get('SELECT id FROM teachers WHERE employee_no = ?', [employee_no]);
+      if (existingEmp) {
+        results.failed.push({
+          row: index + 1,
+          name,
+          reason: `Employee number '${employee_no}' is already in use.`
+        });
+        continue;
+      }
+
+      // Look up class_id
+      let class_id = null;
+      if (class_name) {
+        class_id = classMap[class_name.toLowerCase().trim()] || null;
+        if (!class_id) {
+          results.failed.push({
+            row: index + 1,
+            name,
+            reason: `Class '${class_name}' does not exist.`
+          });
+          continue;
+        }
+      }
+
+      try {
+        // Create user
+        const userResult = await query.run(`
+          INSERT INTO users (school_id, name, email, password, role, phone, invitation_status)
+          VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        `, [schoolId, name, email, password, cleanRole, phone || null]);
+
+        const user_id = userResult.id;
+
+        // Create teacher/staff profile
+        await query.run(`
+          INSERT INTO teachers (user_id, employee_no, department, class_id)
+          VALUES (?, ?, ?, ?)
+        `, [user_id, employee_no, department || null, class_id || null]);
+
+        // Save subject assignments
+        const { class_subjects } = row;
+        if (class_subjects && Array.isArray(class_subjects)) {
+          for (const assignment of class_subjects) {
+            await query.run(`
+              INSERT INTO class_subjects (class_id, subject_id, teacher_id)
+              VALUES (?, ?, ?)
+            `, [assignment.class_id, assignment.subject_id, user_id]);
+
+            await query.run(`
+              INSERT OR IGNORE INTO staff_subjects (teacher_id, subject_id)
+              VALUES (?, ?)
+            `, [user_id, assignment.subject_id]);
+          }
+        }
+
+        results.successful.push({
+          row: index + 1,
+          name,
+          employee_no
+        });
+      } catch (err) {
+        results.failed.push({
+          row: index + 1,
+          name,
+          reason: err.message
+        });
+      }
+    }
+
+    res.json(results);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error during staff import' });
+  }
+});
+
+// ----------------------------------------------------
 // Start Server
 // ----------------------------------------------------
 app.listen(PORT, () => {
   console.log(`SchoolOS AI Backend running on http://localhost:${PORT}`);
 });
+
