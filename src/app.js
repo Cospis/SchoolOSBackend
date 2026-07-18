@@ -35,6 +35,12 @@ app.use('/uploads', express.static(uploadsDir));
       console.log("Migration: Added 'invitation_status' column to 'users' table.");
     }
 
+    const hasPhotoUrlUser = columns.some(c => c.name === 'photo_url');
+    if (!hasPhotoUrlUser) {
+      await query.run("ALTER TABLE users ADD COLUMN photo_url TEXT");
+      console.log("Migration: Added 'photo_url' column to 'users' table.");
+    }
+
     const columnsTeachers = await query.all("PRAGMA table_info(teachers)");
     const hasClassId = columnsTeachers.some(c => c.name === 'class_id');
     if (!hasClassId) {
@@ -263,6 +269,7 @@ app.post('/api/auth/login', async (req, res) => {
         role: user.role,
         phone: user.phone,
         address: user.address,
+        photo_url: user.photo_url,
         school_status: user.school_status,
         ...profileDetails
       }
@@ -335,6 +342,7 @@ app.post('/api/auth/accept-invitation', async (req, res) => {
         role: user.role,
         phone: user.phone,
         address: user.address,
+        photo_url: user.photo_url,
         school_status: user.school_status,
         ...profileDetails
       }
@@ -657,6 +665,107 @@ app.post('/api/school/upload-documents', async (req, res) => {
   }
 });
 
+// Update User Profile Picture
+app.post('/api/user/update-profile-picture', async (req, res) => {
+  const { userId, fileName, fileData } = req.body;
+  if (!userId || !fileName || !fileData) {
+    return res.status(400).json({ message: 'User ID, filename, and image data are required' });
+  }
+
+  try {
+    const base64Content = fileData.split(';base64,').pop();
+    const timestamp = Date.now();
+    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const uniqueFileName = `profile_${userId}_${timestamp}_${sanitizedFileName}`;
+    const filePath = path.join(uploadsDir, uniqueFileName);
+
+    fs.writeFileSync(filePath, base64Content, { encoding: 'base64' });
+    const photoUrl = `/uploads/${uniqueFileName}`;
+
+    await query.run('UPDATE users SET photo_url = ? WHERE id = ?', [photoUrl, userId]);
+    // Also update students table if the user is a student
+    await query.run('UPDATE students SET photo_url = ? WHERE user_id = ?', [photoUrl, userId]);
+
+    res.json({ message: 'Profile picture updated successfully!', photo_url: photoUrl });
+  } catch (error) {
+    console.error('Error uploading profile picture:', error);
+    res.status(500).json({ message: 'Server error updating profile picture' });
+  }
+});
+
+// Generic Image Upload
+app.post('/api/upload-image', async (req, res) => {
+  const { fileName, fileData } = req.body;
+  if (!fileName || !fileData) {
+    return res.status(400).json({ message: 'Filename and image data are required' });
+  }
+
+  try {
+    const base64Content = fileData.split(';base64,').pop();
+    const timestamp = Date.now();
+    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const uniqueFileName = `upload_${timestamp}_${sanitizedFileName}`;
+    const filePath = path.join(uploadsDir, uniqueFileName);
+
+    fs.writeFileSync(filePath, base64Content, { encoding: 'base64' });
+    const fileUrl = `/uploads/${uniqueFileName}`;
+
+    res.json({ url: fileUrl });
+  } catch (error) {
+    console.error('Error in generic upload:', error);
+    res.status(500).json({ message: 'Server error uploading file' });
+  }
+});
+
+// Change Password from Profile
+app.post('/api/user/change-password', async (req, res) => {
+  const { userId, currentPassword, newPassword } = req.body;
+  if (!userId || !currentPassword || !newPassword) {
+    return res.status(400).json({ message: 'User ID, current password, and new password are required' });
+  }
+
+  try {
+    const user = await query.get('SELECT * FROM users WHERE id = ?', [userId]);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ message: 'Current password is incorrect' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+    await query.run('UPDATE users SET password = ? WHERE id = ?', [hashedPassword, userId]);
+
+    res.json({ message: 'Password updated successfully!' });
+  } catch (error) {
+    console.error('Error changing password:', error);
+    res.status(500).json({ message: 'Server error changing password' });
+  }
+});
+
+// GET active user details
+app.get('/api/user/profile', async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) {
+    return res.status(400).json({ message: 'User ID is required' });
+  }
+
+  try {
+    const user = await query.get('SELECT id, name, email, role, phone, address, photo_url FROM users WHERE id = ?', [userId]);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json(user);
+  } catch (error) {
+    console.error('Error fetching user profile:', error);
+    res.status(500).json({ message: 'Server error fetching user profile' });
+  }
+});
+
 app.put('/api/school/profile', async (req, res) => {
   const { name, tagline, logo, address, phone } = req.body;
   const schoolId = req.query.school_id || 1;
@@ -748,7 +857,7 @@ app.get('/api/students', async (req, res) => {
   try {
     const students = await query.all(`
       SELECT s.id as student_id, u.id as user_id, u.name, u.email, u.phone, 
-             c.name as class_name, c.id as class_id, s.admission_no, s.guardian_name, s.guardian_phone, u.active, u.invitation_status
+             c.name as class_name, c.id as class_id, s.admission_no, s.guardian_name, s.guardian_phone, u.active, u.invitation_status, u.photo_url
       FROM students s
       JOIN users u ON s.user_id = u.id
       LEFT JOIN classes c ON s.class_id = c.id
@@ -769,7 +878,7 @@ app.get('/api/students', async (req, res) => {
 });
 
 app.post('/api/students', async (req, res) => {
-  const { name, email, phone, class_id, guardian_name, guardian_phone, school_id } = req.body;
+  const { name, email, phone, class_id, guardian_name, guardian_phone, school_id, photo_url } = req.body;
   const schoolId = school_id || 1;
 
   try {
@@ -778,9 +887,9 @@ app.post('/api/students', async (req, res) => {
 
     // Create user
     const userResult = await query.run(`
-      INSERT INTO users (school_id, name, email, password, role, phone, invitation_status)
-      VALUES (?, ?, ?, ?, 'student', ?, 'pending')
-    `, [schoolId, name, email, password, phone]);
+      INSERT INTO users (school_id, name, email, password, role, phone, invitation_status, photo_url)
+      VALUES (?, ?, ?, ?, 'student', ?, 'pending', ?)
+    `, [schoolId, name, email, password, phone, photo_url || null]);
 
     const user_id = userResult.id;
     const userObj = {
@@ -796,9 +905,9 @@ app.post('/api/students', async (req, res) => {
 
     // Create student profile
     const studentResult = await query.run(`
-      INSERT INTO students (user_id, class_id, admission_no, guardian_name, guardian_phone)
-      VALUES (?, ?, ?, ?, ?)
-    `, [user_id, class_id, admission_no, guardian_name, guardian_phone]);
+      INSERT INTO students (user_id, class_id, admission_no, guardian_name, guardian_phone, photo_url)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `, [user_id, class_id, admission_no, guardian_name, guardian_phone, photo_url || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150']);
 
     // Create invoice for default class fees
     const activeTerm = await query.get('SELECT t.id FROM terms t JOIN sessions s ON t.session_id = s.id WHERE t.active = 1 AND s.school_id = ? LIMIT 1', [schoolId]);
@@ -899,7 +1008,7 @@ app.get('/api/teachers', async (req, res) => {
   const schoolId = req.query.school_id || 1;
   try {
     const teachers = await query.all(`
-      SELECT t.id as teacher_id, u.id as user_id, u.name, u.email, u.phone, u.role, u.active, u.invitation_status, t.employee_no, t.department, t.class_id, c.name as class_name
+      SELECT t.id as teacher_id, u.id as user_id, u.name, u.email, u.phone, u.role, u.active, u.invitation_status, t.employee_no, t.department, t.class_id, c.name as class_name, u.photo_url
       FROM teachers t
       JOIN users u ON t.user_id = u.id
       LEFT JOIN classes c ON t.class_id = c.id
@@ -937,7 +1046,7 @@ app.get('/api/teachers', async (req, res) => {
 });
 
 app.post('/api/teachers', async (req, res) => {
-  const { name, email, phone, role, employee_no, department, class_id, class_subjects, school_id } = req.body;
+  const { name, email, phone, role, employee_no, department, class_id, class_subjects, school_id, photo_url } = req.body;
   const schoolId = school_id || 1;
 
   if (!name || !email || !role || !employee_no) {
@@ -966,9 +1075,9 @@ app.post('/api/teachers', async (req, res) => {
 
     // Create user
     const userResult = await query.run(`
-      INSERT INTO users (school_id, name, email, password, role, phone, invitation_status)
-      VALUES (?, ?, ?, ?, ?, ?, 'pending')
-    `, [schoolId, name, email, password, role, phone]);
+      INSERT INTO users (school_id, name, email, password, role, phone, invitation_status, photo_url)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+    `, [schoolId, name, email, password, role, phone, photo_url || null]);
 
     const user_id = userResult.id;
     const userObj = {
@@ -1493,7 +1602,7 @@ app.get('/api/results/student/:studentId', async (req, res) => {
     if (!activeTerm) return res.status(404).json({ message: 'No active term found' });
 
     const studentInfo = await query.get(`
-      SELECT s.id as student_id, u.name as student_name, s.admission_no, c.name as class_name, c.id as class_id, s.photo_url
+      SELECT s.id as student_id, u.name as student_name, s.admission_no, c.name as class_name, c.id as class_id, u.photo_url
       FROM students s
       JOIN users u ON s.user_id = u.id
       JOIN classes c ON s.class_id = c.id
