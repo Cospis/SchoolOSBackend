@@ -6,6 +6,24 @@ async function seed() {
 
   try {
     // 1. Create Tables
+    console.log('Dropping existing tables to force rebuild...');
+    await query.exec('DROP TABLE IF EXISTS notifications');
+    await query.exec('DROP TABLE IF EXISTS payments');
+    await query.exec('DROP TABLE IF EXISTS invoices');
+    await query.exec('DROP TABLE IF EXISTS fee_structures');
+    await query.exec('DROP TABLE IF EXISTS results');
+    await query.exec('DROP TABLE IF EXISTS attendance');
+    await query.exec('DROP TABLE IF EXISTS staff_subjects');
+    await query.exec('DROP TABLE IF EXISTS teachers');
+    await query.exec('DROP TABLE IF EXISTS students');
+    await query.exec('DROP TABLE IF EXISTS class_subjects');
+    await query.exec('DROP TABLE IF EXISTS subjects');
+    await query.exec('DROP TABLE IF EXISTS classes');
+    await query.exec('DROP TABLE IF EXISTS terms');
+    await query.exec('DROP TABLE IF EXISTS sessions');
+    await query.exec('DROP TABLE IF EXISTS users');
+    await query.exec('DROP TABLE IF EXISTS schools');
+
     console.log('Creating tables...');
 
     await query.exec(`
@@ -15,7 +33,9 @@ async function seed() {
         tagline TEXT,
         logo TEXT,
         address TEXT,
-        phone TEXT
+        phone TEXT,
+        status TEXT CHECK(status IN ('pending', 'approved')) DEFAULT 'pending',
+        verification_docs TEXT
       );
     `);
 
@@ -26,7 +46,7 @@ async function seed() {
         name TEXT NOT NULL,
         email TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
-        role TEXT CHECK(role IN ('admin', 'principal', 'bursar', 'teacher', 'parent', 'student')),
+        role TEXT CHECK(role IN ('superadmin', 'admin', 'principal', 'bursar', 'teacher', 'parent', 'student')),
         phone TEXT,
         address TEXT,
         active INTEGER DEFAULT 1,
@@ -97,6 +117,7 @@ async function seed() {
         admission_no TEXT UNIQUE NOT NULL,
         guardian_name TEXT,
         guardian_phone TEXT,
+        photo_url TEXT DEFAULT 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150',
         FOREIGN KEY (user_id) REFERENCES users(id),
         FOREIGN KEY (class_id) REFERENCES classes(id),
         FOREIGN KEY (parent_id) REFERENCES users(id)
@@ -186,40 +207,51 @@ async function seed() {
 
     console.log('Tables created successfully. Seeding data...');
 
-    // 2. Clear Existing Data
-    await query.run('DELETE FROM payments');
-    await query.run('DELETE FROM invoices');
-    await query.run('DELETE FROM fee_structures');
-    await query.run('DELETE FROM results');
-    await query.run('DELETE FROM attendance');
-    await query.run('DELETE FROM teachers');
-    await query.run('DELETE FROM students');
-    await query.run('DELETE FROM class_subjects');
-    await query.run('DELETE FROM subjects');
-    await query.run('DELETE FROM classes');
-    await query.run('DELETE FROM terms');
-    await query.run('DELETE FROM sessions');
-    await query.run('DELETE FROM users');
-    await query.run('DELETE FROM schools');
-
-    // 3. Insert School
+    // 3. Insert School (Approved Greenwood school)
     const school = await query.run(`
-      INSERT INTO schools (name, tagline, logo, address, phone)
+      INSERT INTO schools (name, tagline, logo, address, phone, status)
       VALUES (
         'Greenwood International Academy',
         'Nurturing Leaders of Tomorrow',
         'https://images.unsplash.com/photo-1546410531-bb4caa6b424d?w=150',
         '12 Alfred Rewane Road, Ikoyi, Lagos, Nigeria',
-        '+234 1 234 5678'
+        '+234 1 234 5678',
+        'approved'
       )
     `);
     const schoolId = school.id;
+
+    // Insert Pending School (Oakwood Prep Academy)
+    const pendingSchool = await query.run(`
+      INSERT INTO schools (name, tagline, logo, address, phone, status)
+      VALUES (
+        'Oakwood Prep Academy',
+        'Knowledge, Character, Excellence',
+        'https://images.unsplash.com/photo-1509062522246-3755977927d7?w=150',
+        '45 Gbagada Expressway, Lagos, Nigeria',
+        '+234 1 987 6543',
+        'pending'
+      )
+    `);
+    const pendingSchoolId = pendingSchool.id;
 
     // 4. Create Users (with hashed passwords)
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash('password123', salt);
 
-    // Admin / Proprietor
+    // Superadmin (Overall Admin)
+    await query.run(`
+      INSERT INTO users (school_id, name, email, password, role, phone, address)
+      VALUES (NULL, 'System Administrator', 'superadmin@schoolos.com', ?, 'superadmin', '+10000000000', 'Global Headquarters')
+    `, [hashedPassword]);
+
+    // Pending Proprietor
+    await query.run(`
+      INSERT INTO users (school_id, name, email, password, role, phone, address)
+      VALUES (?, 'Oakwood Proprietor', 'pending-proprietor@schoolos.com', ?, 'admin', '+2348030000009', 'Gbagada, Lagos')
+    `, [pendingSchoolId, hashedPassword]);
+
+    // Admin / Proprietor (Approved)
     const adminUser = await query.run(`
       INSERT INTO users (school_id, name, email, password, role, phone, address)
       VALUES (?, 'Chief Abdul-Malik', 'admin@schoolos.com', ?, 'admin', '+2348030000001', 'Ikoyi, Lagos')
@@ -323,13 +355,13 @@ async function seed() {
 
     // 9. Map Student details
     const student1 = await query.run(`
-      INSERT INTO students (user_id, class_id, parent_id, admission_no, guardian_name, guardian_phone)
-      VALUES (?, ?, ?, 'ADM25001', 'Alhaji Ibrahim Musa', '+2348030000006')
+      INSERT INTO students (user_id, class_id, parent_id, admission_no, guardian_name, guardian_phone, photo_url)
+      VALUES (?, ?, ?, 'ADM25001', 'Alhaji Ibrahim Musa', '+2348030000006', 'https://images.unsplash.com/photo-1503919545889-aef636e10ad4?w=150&auto=format&fit=crop&q=80')
     `, [studentUser1.id, classJss1.id, parentUser.id]);
 
     const student2 = await query.run(`
-      INSERT INTO students (user_id, class_id, parent_id, admission_no, guardian_name, guardian_phone)
-      VALUES (?, ?, ?, 'ADM25002', 'Alhaji Ibrahim Musa', '+2348030000006')
+      INSERT INTO students (user_id, class_id, parent_id, admission_no, guardian_name, guardian_phone, photo_url)
+      VALUES (?, ?, ?, 'ADM25002', 'Alhaji Ibrahim Musa', '+2348030000006', 'https://images.unsplash.com/photo-1491013516836-7db643ee125a?w=150&auto=format&fit=crop&q=80')
     `, [studentUser2.id, classJss2.id, parentUser.id]);
 
     // 10. Link Teachers to Class Subjects

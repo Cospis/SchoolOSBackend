@@ -1,12 +1,23 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { query } = require('./config/database');
+const { sendNewUserInvite, sendPasswordResetEmail } = require('./utils/mailer');
+const { encrypt, decrypt } = require('./utils/crypto');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'schoolos_secret_key_123';
+
+const fs = require('fs');
+const path = require('path');
+const uploadsDir = path.join(__dirname, '../uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+app.use('/uploads', express.static(uploadsDir));
 
 // Database Migration for 'active' column and teacher profiles
 (async () => {
@@ -159,6 +170,21 @@ const JWT_SECRET = process.env.JWT_SECRET || 'schoolos_secret_key_123';
       console.log("Migration: Seeded default family discount plans.");
     }
 
+    // Migration: Add photo_url to students table
+    const columnsStudents = await query.all("PRAGMA table_info(students)");
+    const hasPhotoUrl = columnsStudents.some(c => c.name === 'photo_url');
+    if (!hasPhotoUrl) {
+      await query.run("ALTER TABLE students ADD COLUMN photo_url TEXT DEFAULT 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150'");
+      console.log("Migration: Added 'photo_url' column to 'students' table.");
+      
+      // Update existing seeded students with photo URLs:
+      // ADM25001 = Aliyu Musa (boy)
+      // ADM25002 = Aisha Musa (girl)
+      await query.run("UPDATE students SET photo_url = 'https://images.unsplash.com/photo-1503919545889-aef636e10ad4?w=150&auto=format&fit=crop&q=80' WHERE admission_no = 'ADM25001'");
+      await query.run("UPDATE students SET photo_url = 'https://images.unsplash.com/photo-1491013516836-7db643ee125a?w=150&auto=format&fit=crop&q=80' WHERE admission_no = 'ADM25002'");
+      console.log("Migration: Updated seeded student photos.");
+    }
+
   } catch (err) {
     console.error("Migration error:", err);
   }
@@ -185,7 +211,7 @@ app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    const user = await query.get('SELECT * FROM users WHERE email = ?', [email]);
+    const user = await query.get('SELECT u.*, s.status as school_status FROM users u LEFT JOIN schools s ON u.school_id = s.id WHERE u.email = ?', [email]);
     if (!user) {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
@@ -237,6 +263,7 @@ app.post('/api/auth/login', async (req, res) => {
         role: user.role,
         phone: user.phone,
         address: user.address,
+        school_status: user.school_status,
         ...profileDetails
       }
     });
@@ -254,7 +281,7 @@ app.post('/api/auth/accept-invitation', async (req, res) => {
   }
 
   try {
-    const user = await query.get('SELECT * FROM users WHERE email = ?', [email]);
+    const user = await query.get('SELECT u.*, s.status as school_status FROM users u LEFT JOIN schools s ON u.school_id = s.id WHERE u.email = ?', [email]);
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
@@ -308,12 +335,140 @@ app.post('/api/auth/accept-invitation', async (req, res) => {
         role: user.role,
         phone: user.phone,
         address: user.address,
+        school_status: user.school_status,
         ...profileDetails
       }
     });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.get('/api/auth/verify-invitation', async (req, res) => {
+  const { token } = req.query;
+
+  if (!token) {
+    return res.status(400).json({ message: 'Invitation token is required' });
+  }
+
+  const email = decrypt(token);
+  if (!email) {
+    return res.status(400).json({ message: 'Invalid or tampered invitation link' });
+  }
+
+  try {
+    const user = await query.get('SELECT * FROM users WHERE email = ?', [email]);
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid invitation link (user not found)' });
+    }
+
+    if (user.active === 0) {
+      return res.status(400).json({ message: 'This invitation has been deactivated' });
+    }
+
+    if (user.invitation_status !== 'pending') {
+      return res.status(400).json({ message: 'This invitation has already been accepted' });
+    }
+
+    res.json({ email: user.email, name: user.name, role: user.role });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error verifying invitation' });
+  }
+});
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ message: 'Email address is required' });
+  }
+
+  try {
+    const user = await query.get('SELECT * FROM users WHERE email = ?', [email]);
+    if (!user) {
+      // To prevent user enumeration, we still return a generic success message
+      return res.json({ message: 'If the email exists in our system, a reset link has been sent.' });
+    }
+
+    if (user.active === 0) {
+      return res.status(403).json({ message: 'Account is deactivated.' });
+    }
+
+    const mailResult = await sendPasswordResetEmail(user);
+    res.json({
+      message: 'If the email exists in our system, a reset link has been sent.',
+      success: mailResult.success,
+      method: mailResult.method,
+      nodemailerAvailable: mailResult.nodemailerAvailable
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error during forgot password request' });
+  }
+});
+
+app.get('/api/auth/verify-reset-token', async (req, res) => {
+  const { token } = req.query;
+
+  if (!token) {
+    return res.status(400).json({ message: 'Token is required' });
+  }
+
+  const email = decrypt(token);
+  if (!email) {
+    return res.status(400).json({ message: 'Invalid or expired password reset link' });
+  }
+
+  try {
+    const user = await query.get('SELECT * FROM users WHERE email = ?', [email]);
+    if (!user) {
+      return res.status(400).json({ message: 'User not found' });
+    }
+
+    if (user.active === 0) {
+      return res.status(400).json({ message: 'Account has been deactivated' });
+    }
+
+    res.json({ email: user.email, name: user.name });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error verifying reset token' });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { token, password } = req.body;
+
+  if (!token || !password) {
+    return res.status(400).json({ message: 'Token and password are required' });
+  }
+
+  const email = decrypt(token);
+  if (!email) {
+    return res.status(400).json({ message: 'Invalid or expired password reset link' });
+  }
+
+  try {
+    const user = await query.get('SELECT * FROM users WHERE email = ?', [email]);
+    if (!user) {
+      return res.status(400).json({ message: 'User not found' });
+    }
+
+    if (user.active === 0) {
+      return res.status(400).json({ message: 'Account is deactivated' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    await query.run('UPDATE users SET password = ? WHERE id = ?', [hashedPassword, user.id]);
+
+    res.json({ message: 'Password reset successful' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error resetting password' });
   }
 });
 
@@ -331,18 +486,28 @@ app.post('/api/auth/register-proprietor', async (req, res) => {
     }
 
     const schoolResult = await query.run(`
-      INSERT INTO schools (name, tagline, address, phone)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO schools (name, tagline, address, phone, status)
+      VALUES (?, ?, ?, ?, 'pending')
     `, [schoolName, schoolTagline || '', address || '', phone || '']);
     const schoolId = schoolResult.id;
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    await query.run(`
+    const userResult = await query.run(`
       INSERT INTO users (school_id, name, email, password, role, phone, address)
       VALUES (?, ?, ?, ?, 'admin', ?, ?)
     `, [schoolId, name, email, hashedPassword, phone || '', address || '']);
+
+    const userObj = {
+      id: userResult.id,
+      school_id: schoolId,
+      name,
+      email,
+      role: 'admin',
+      invitation_status: 'active'
+    };
+    sendNewUserInvite(userObj, password).catch(console.error);
 
     const sessionResult = await query.run(`
       INSERT INTO sessions (school_id, name, active)
@@ -402,6 +567,106 @@ app.get('/api/school/info', async (req, res) => {
       session,
       term
     });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET all schools for Superadmin
+app.get('/api/superadmin/schools', async (req, res) => {
+  try {
+    const schools = await query.all(`
+      SELECT s.*, u.name as proprietor_name, u.email as proprietor_email, u.phone as proprietor_phone
+      FROM schools s
+      LEFT JOIN users u ON u.school_id = s.id AND u.role = 'admin'
+    `);
+    res.json(schools);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error fetching schools' });
+  }
+});
+
+// APPROVE a school
+app.post('/api/superadmin/schools/:schoolId/approve', async (req, res) => {
+  const { schoolId } = req.params;
+  try {
+    await query.run("UPDATE schools SET status = 'approved' WHERE id = ?", [schoolId]);
+    res.json({ message: 'School approved successfully!' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error approving school' });
+  }
+});
+
+// UNAPPROVE/PEND a school
+app.post('/api/superadmin/schools/:schoolId/unapprove', async (req, res) => {
+  const { schoolId } = req.params;
+  try {
+    await query.run("UPDATE schools SET status = 'pending' WHERE id = ?", [schoolId]);
+    res.json({ message: 'School unapproved/set to pending!' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error unapproving school' });
+  }
+});
+
+// UPLOAD verification documents for school
+app.post('/api/school/upload-documents', async (req, res) => {
+  const { schoolId, documents } = req.body;
+  if (!schoolId || !documents || !Array.isArray(documents)) {
+    return res.status(400).json({ message: 'School ID and documents array are required' });
+  }
+
+  try {
+    const savedDocs = [];
+
+    for (const doc of documents) {
+      const { name, fileName, fileData } = doc;
+      if (!name || !fileName || !fileData) continue;
+
+      // Extract raw base64 data
+      const base64Content = fileData.split(';base64,').pop();
+      
+      // Clean filename and make unique
+      const timestamp = Date.now();
+      const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, '_');
+      const uniqueFileName = `school_${schoolId}_${timestamp}_${sanitizedFileName}`;
+      
+      const filePath = path.join(uploadsDir, uniqueFileName);
+      
+      // Write file to uploads folder
+      fs.writeFileSync(filePath, base64Content, { encoding: 'base64' });
+
+      savedDocs.push({
+        name,
+        fileName,
+        url: `/uploads/${uniqueFileName}`
+      });
+    }
+
+    // Save list of uploaded files to database
+    const jsonDocs = JSON.stringify(savedDocs);
+    await query.run("UPDATE schools SET verification_docs = ? WHERE id = ?", [jsonDocs, schoolId]);
+
+    res.json({ message: 'Documents uploaded successfully! Your verification is pending review.' });
+  } catch (error) {
+    console.error('Error handling file upload:', error);
+    res.status(500).json({ message: 'Server error saving uploaded documents' });
+  }
+});
+
+app.put('/api/school/profile', async (req, res) => {
+  const { name, tagline, logo, address, phone } = req.body;
+  const schoolId = req.query.school_id || 1;
+  try {
+    await query.run(`
+      UPDATE schools
+      SET name = ?, tagline = ?, logo = ?, address = ?, phone = ?
+      WHERE id = ?
+    `, [name, tagline, logo, address, phone, schoolId]);
+    res.json({ message: 'School profile updated successfully' });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Server error' });
@@ -483,12 +748,19 @@ app.get('/api/students', async (req, res) => {
   try {
     const students = await query.all(`
       SELECT s.id as student_id, u.id as user_id, u.name, u.email, u.phone, 
-             c.name as class_name, c.id as class_id, s.admission_no, s.guardian_name, s.guardian_phone, u.active
+             c.name as class_name, c.id as class_id, s.admission_no, s.guardian_name, s.guardian_phone, u.active, u.invitation_status
       FROM students s
       JOIN users u ON s.user_id = u.id
       LEFT JOIN classes c ON s.class_id = c.id
       WHERE u.school_id = ?
     `, [schoolId]);
+
+    for (const s of students) {
+      if (s.invitation_status === 'pending') {
+        s.invitation_token = encrypt(s.email);
+      }
+    }
+
     res.json(students);
   } catch (error) {
     console.error(error);
@@ -506,11 +778,20 @@ app.post('/api/students', async (req, res) => {
 
     // Create user
     const userResult = await query.run(`
-      INSERT INTO users (school_id, name, email, password, role, phone)
-      VALUES (?, ?, ?, ?, 'student', ?)
+      INSERT INTO users (school_id, name, email, password, role, phone, invitation_status)
+      VALUES (?, ?, ?, ?, 'student', ?, 'pending')
     `, [schoolId, name, email, password, phone]);
 
     const user_id = userResult.id;
+    const userObj = {
+      id: user_id,
+      school_id: schoolId,
+      name,
+      email,
+      role: 'student',
+      invitation_status: 'pending'
+    };
+    sendNewUserInvite(userObj, 'password123').catch(console.error);
     const admission_no = 'ADM' + Date.now().toString().slice(-6);
 
     // Create student profile
@@ -583,6 +864,34 @@ app.put('/api/students/:studentId', async (req, res) => {
   }
 });
 
+app.post('/api/students/:studentId/resend-invite', async (req, res) => {
+  const { studentId } = req.params;
+  try {
+    const student = await query.get('SELECT user_id FROM students WHERE id = ?', [studentId]);
+    if (!student) {
+      return res.status(404).json({ message: 'Student not found' });
+    }
+    const user = await query.get('SELECT * FROM users WHERE id = ?', [student.user_id]);
+    if (!user) {
+      return res.status(404).json({ message: 'User details not found' });
+    }
+    if (user.invitation_status !== 'pending') {
+      return res.status(400).json({ message: 'This student invitation is no longer pending.' });
+    }
+
+    const mailResult = await sendNewUserInvite(user, 'password123');
+    res.json({
+      message: 'Invitation email processed successfully',
+      success: mailResult.success,
+      method: mailResult.method,
+      nodemailerAvailable: mailResult.nodemailerAvailable
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // ----------------------------------------------------
 // 5. Staff Management
 // ----------------------------------------------------
@@ -614,6 +923,10 @@ app.get('/api/teachers', async (req, res) => {
         WHERE cs.teacher_id = ?
       `, [t.user_id]);
       t.class_subjects = classSubjects || [];
+
+      if (t.invitation_status === 'pending') {
+        t.invitation_token = encrypt(t.email);
+      }
     }
 
     res.json(teachers);
@@ -658,6 +971,15 @@ app.post('/api/teachers', async (req, res) => {
     `, [schoolId, name, email, password, role, phone]);
 
     const user_id = userResult.id;
+    const userObj = {
+      id: user_id,
+      school_id: schoolId,
+      name,
+      email,
+      role,
+      invitation_status: 'pending'
+    };
+    sendNewUserInvite(userObj, 'password123').catch(console.error);
 
     // Create teacher/staff profile
     const teacherResult = await query.run(`
@@ -754,6 +1076,34 @@ app.put('/api/teachers/:teacherId', async (req, res) => {
     }
 
     res.json({ message: 'Staff member updated successfully' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.post('/api/teachers/:teacherId/resend-invite', async (req, res) => {
+  const { teacherId } = req.params;
+  try {
+    const teacher = await query.get('SELECT user_id FROM teachers WHERE id = ?', [teacherId]);
+    if (!teacher) {
+      return res.status(404).json({ message: 'Staff member not found' });
+    }
+    const user = await query.get('SELECT * FROM users WHERE id = ?', [teacher.user_id]);
+    if (!user) {
+      return res.status(404).json({ message: 'User details not found' });
+    }
+    if (user.invitation_status !== 'pending') {
+      return res.status(400).json({ message: 'This user invitation is no longer pending.' });
+    }
+
+    const mailResult = await sendNewUserInvite(user, 'password123');
+    res.json({
+      message: 'Invitation email processed successfully',
+      success: mailResult.success,
+      method: mailResult.method,
+      nodemailerAvailable: mailResult.nodemailerAvailable
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Server error' });
@@ -1143,7 +1493,7 @@ app.get('/api/results/student/:studentId', async (req, res) => {
     if (!activeTerm) return res.status(404).json({ message: 'No active term found' });
 
     const studentInfo = await query.get(`
-      SELECT s.id as student_id, u.name as student_name, s.admission_no, c.name as class_name, c.id as class_id
+      SELECT s.id as student_id, u.name as student_name, s.admission_no, c.name as class_name, c.id as class_id, s.photo_url
       FROM students s
       JOIN users u ON s.user_id = u.id
       JOIN classes c ON s.class_id = c.id
@@ -1311,7 +1661,7 @@ app.get('/api/parent/children/:parentUserId', async (req, res) => {
     if (!parent) return res.status(404).json({ message: 'Parent user not found' });
 
     const children = await query.all(`
-      SELECT s.id as student_id, u.name as child_name, s.admission_no, c.name as class_name, c.id as class_id
+      SELECT s.id as student_id, u.name as child_name, s.admission_no, c.name as class_name, c.id as class_id, s.photo_url
       FROM students s
       JOIN users u ON s.user_id = u.id
       JOIN classes c ON s.class_id = c.id
@@ -1781,17 +2131,27 @@ app.put('/api/notifications/:id/read', async (req, res) => {
 });
 
 app.post('/api/admin/broadcast-notification', async (req, res) => {
-  const { type, title, message, targetRole } = req.body;
+  const { type, title, message, targetRole, schoolId, senderRole } = req.body;
   if (!type || !title || !message || !targetRole) {
     return res.status(400).json({ message: 'All notification fields are required' });
   }
 
   try {
-    let usersQuery = 'SELECT id FROM users';
+    let usersQuery = 'SELECT id FROM users WHERE 1=1';
     let queryParams = [];
 
+    // If sender is NOT a superadmin, restrict notifications to their own school
+    if (senderRole !== 'superadmin') {
+      if (!schoolId) {
+        return res.status(400).json({ message: 'School ID is required for non-superadmin broadcasts' });
+      }
+      usersQuery += ' AND school_id = ?';
+      queryParams.push(schoolId);
+    }
+
+    // Role-based target filtering
     if (targetRole !== 'all') {
-      usersQuery += ' WHERE role = ?';
+      usersQuery += ' AND role = ?';
       queryParams.push(targetRole);
     }
 
@@ -1987,11 +2347,20 @@ app.post('/api/students/import', async (req, res) => {
       try {
         // Insert user
         const userResult = await query.run(`
-          INSERT INTO users (school_id, name, email, password, role, phone)
-          VALUES (?, ?, ?, ?, 'student', ?)
+          INSERT INTO users (school_id, name, email, password, role, phone, invitation_status)
+          VALUES (?, ?, ?, ?, 'student', ?, 'pending')
         `, [schoolId, name, email, password, phone || null]);
 
         const user_id = userResult.id;
+        const userObj = {
+          id: user_id,
+          school_id: schoolId,
+          name,
+          email,
+          role: 'student',
+          invitation_status: 'pending'
+        };
+        sendNewUserInvite(userObj, 'password123').catch(console.error);
         const admission_no = 'ADM' + Date.now().toString().slice(-6) + index;
 
         // Create student profile
@@ -2126,6 +2495,15 @@ app.post('/api/teachers/import', async (req, res) => {
         `, [schoolId, name, email, password, cleanRole, phone || null]);
 
         const user_id = userResult.id;
+        const userObj = {
+          id: user_id,
+          school_id: schoolId,
+          name,
+          email,
+          role: cleanRole,
+          invitation_status: 'pending'
+        };
+        sendNewUserInvite(userObj, 'password123').catch(console.error);
 
         // Create teacher/staff profile
         await query.run(`
